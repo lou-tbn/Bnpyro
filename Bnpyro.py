@@ -11,18 +11,17 @@ Usage:
     bn   = BNContext()
     rain = bn.sample("rain", dist.Bernoulli(0.2))
     wet  = bn.sample("wet",  bn.where(rain, 0.7, 0.01))
-    coin = bn.thunk("coin", bn.where(rain, 0.8, 0.3))  # "!" from λ!-calculus
-    y1   = coin()                                        # "der" #1
-    y2   = coin()                                        # "der" #2
+    coin = bn.plate("coin", bn.where(rain, 0.8, 0.3))  # "!" from λ!-calculus
+    y1   = coin()                                       # "der" #1
+    y2   = coin()                                       # "der" #2
 
     p = bn.query("rain", evidence={"wet": True})
 
 Correspondence with λ!-calculus (Faggian, Pautasso, Vanoni - POPL 2024):
     bn.sample("x", Bernoulli(p))           <->  let x = sample_d
     bn.sample("x", bn.where(parents, ...)) <->  let x = case⟨parents⟩
-    bn.thunk("f", dist)                    <->  let f = !t
+    bn.plate("f", dist)                    <->  let f = !t
     f()                                    <->  der f
-    for i in bn.plate("s", N): ...         <->  Template BN
 
 Dependencies:
     pip install pyagrum pyro-ppl torch
@@ -133,20 +132,20 @@ class BNNode:
             f"Use bn.where(condition, p_true, p_false) to build conditional distributions."
         )
 
-class BNThunk:
+class BNPlate:
     """
-    Thunk from λ!-calculus: a frozen, reusable distribution.
-    each call () instantiates a new node (der).
+    Plate from λ!-calculus: a frozen, reusable distribution (!t / bang).
+    Each call () instantiates a new independent node (der).
 
     Two modes:
-      Simple     - bn.thunk("f", dist.Bernoulli(0.5))                     zero-arg thunk
-      Parametric - bn.thunk("f", lambda b: dist.Bernoulli(b), [bias_node]) thunk of one argument
+      Simple     - bn.plate("coin", dist.Bernoulli(0.5))
+      Parametric - bn.plate("coin", lambda b: dist.Bernoulli(b), parents=[bias_node])
     """
 
     def __init__(self, ctx: "BNContext", base_name: str,
                  dist_or_fn, fn_parents: Optional[list] = None):
-        self._ctx  = ctx
-        self._base_name  = base_name
+        self._ctx = ctx
+        self._base_name = base_name
         self._dist_or_fn = dist_or_fn
         self._fn_parents = fn_parents or []
         self._call_count = 0
@@ -161,41 +160,12 @@ class BNThunk:
         else:
             node = self._ctx.sample(node_name, d)
 
-        # Track thunk metadata immediately (used by show_graph)
-        self._ctx._thunk_derived.add(node.name)
-        self._ctx._thunk_groups.setdefault(self._base_name, []).append(node.name)
+        self._ctx._plate_derived.add(node.name)
+        self._ctx._plate_groups.setdefault(self._base_name, []).append(node.name)
         return node
 
     def __repr__(self):
-        return f"BNThunk({self._base_name!r}, calls={self._call_count})"
-
-class BNPair:
-    """
-    Ordered pair of BNNodes: corresponds to ⊗ (tensor product) in λ!-calculus.
-
-    Supports Python tuple destructuring:
-        x, y = bn_pair
-
-    Notes:
-        pyAgrum does not support tuple-valued nodes, so BNPair is simply
-        a structured container for two existing BNNodes. The joint
-        distribution is represented implicitly by their shared parents.
-    """
-
-    def __init__(self, first: BNNode, second: BNNode):
-        self.first  = first
-        self.second = second
-
-    def __iter__(self):
-        yield self.first
-        yield self.second
-
-    def __getitem__(self, i: int) -> BNNode:
-        return (self.first, self.second)[i]
-
-    def __repr__(self):
-        return f"({self.first.name}, {self.second.name})"
-
+        return f"BNPlate({self._base_name!r}, calls={self._call_count})"
 
 # Internal structures
 
@@ -248,27 +218,12 @@ class _NodeSpec:
     dist_or_fn: object # distribution, _BernoulliCPT, or callable
     parents: list # list[BNNode] stubs (resolved at compile time)
     node: "BNNode" # stub returned to the user
-    is_thunk_derived: bool = False
-    thunk_base_name: str = None
+    is_plate_derived: bool = False
+    plate_base_name: str = None
     n_bins_override: Optional[int] = None  # per-node bin count (overrides strategy)
 
 
 # Plate iterator
-
-class _PlateIterator:
-    """Iterator for bn.plate(): prefixes node names at each iteration."""
-
-    def __init__(self, ctx: "BNContext", name: str, size: int):
-        self._ctx = ctx
-        self._name = name
-        self._size = size
-
-    def __iter__(self):
-        for i in range(self._size):
-            self._ctx._plate_prefix.append(f"{self._name}_{i}")
-            yield i
-            self._ctx._plate_prefix.pop()
-
 
 # MAIN CONTEXT
 
@@ -312,12 +267,12 @@ class BNContext:
         """
         Parameters
         ----------
-        n_bins               : default number of bins for continuous nodes
-        discretization_method: MIDPOINT (fast) or INTEGRATION (precise)
-        bin_strategy         : BIN_UNIFORM (all nodes same) or BIN_ADAPTIVE
+        n_bins : default number of bins for continuous nodes
+        discretization_method : MIDPOINT (fast) or INTEGRATION (precise)
+        bin_strategy : BIN_UNIFORM (all nodes same) or BIN_ADAPTIVE
                                (fewer bins for nodes with many continuous parents)
-        memory_warn_mb       : print a warning if total CPT size exceeds this (MB)
-        memory_limit_mb      : raise RuntimeError if total CPT size exceeds this (MB).
+        memory_warn_mb : print a warning if total CPT size exceeds this (MB)
+        memory_limit_mb : raise RuntimeError if total CPT size exceeds this (MB).
                                None = no hard limit.
         """
         if discretization_method not in (MIDPOINT, INTEGRATION):
@@ -332,14 +287,12 @@ class BNContext:
         self._state: str = DESIGN
         self._specs: list[_NodeSpec] = []
         self._n_bins: int = n_bins
-        self._bin_strategy:    str             = bin_strategy
-        self._memory_warn_mb:  float           = memory_warn_mb
+        self._bin_strategy: str = bin_strategy
+        self._memory_warn_mb: float = memory_warn_mb
         self._memory_limit_mb: Optional[float] = memory_limit_mb
-        self._plate_prefix: list[str] = []
         self._discretization_method: str = discretization_method
-        self._plates: dict[str, int] = {}
-        self._thunk_derived: set[str] = set()
-        self._thunk_groups:  dict[str, list] = {}
+        self._plate_derived: set[str] = set()
+        self._plate_groups: dict[str, list] = {}
         # COMPILED state (populated by compile()) 
         self._gum_bn: Optional[gum.BayesNet] = None
         self._nodes:  dict[str, BNNode] = {}
@@ -393,35 +346,24 @@ class BNContext:
         ))
         return stub
 
-    # thunk
-    def thunk(self, name: str, distribution_or_fn,
-              parents: Optional[list] = None) -> BNThunk:
+    # plate
+    def plate(self, name: str, distribution_or_fn,
+              parents: Optional[list] = None) -> BNPlate:
         """
-        Freezes a distribution - corresponds to !t in λ!-calculus.
-        Each call () instantiates a new node (der).
+        Freezes a distribution so it can be instantiated multiple times.
+        Corresponds to !t (bang) in λ!-calculus; each call () is a deref (der).
 
-        Simple (zero-arg thunk):
-            coin = bn.thunk("coin", bn.where(bias, 0.8, 0.3))
-            coin = bn.thunk("coin", dist.Bernoulli(0.5))
+        Simple (zero-arg):
+            coin = bn.plate("coin", bn.where(bias, 0.8, 0.3))
+            coin = bn.plate("coin", dist.Bernoulli(0.5))
+            y1 = coin()   # creates coin_1
+            y2 = coin()   # creates coin_2, independent of coin_1
 
-        Parametric (thunk of one argument — higher-order):
-            coin = bn.thunk("coin", lambda b: dist.Bernoulli(b), parents=[bias_node])
+        Parametric (one shared parent):
+            coin = bn.plate("coin", lambda b: dist.Bernoulli(b), parents=[bias_node])
             Each coin() creates a node ~ Bernoulli(bias_node) via the lambda.
         """
-        return BNThunk(self, name, distribution_or_fn, parents)
-
-    # plate
-    def plate(self, name: str, size: int) -> _PlateIterator:
-        """
-        Repeats a BN structure N times (Template BN, corresponds to plate notation).
-
-        Usage:
-            for i in bn.plate("students", 5):
-                skill  = bn.sample("skill",  dist.Bernoulli(0.6))
-                result = bn.sample("result", bn.where(skill, 0.9, 0.1))
-        """
-        self._plates[name] = size
-        return _PlateIterator(self, name, size)
+        return BNPlate(self, name, distribution_or_fn, parents)
 
     # recurse
     def recurse(self, name: str, step_fn: Callable, n_steps: int) -> list:
@@ -483,37 +425,18 @@ class BNContext:
             raise TypeError(f"condition must be a BNNode, got {type(condition)}")
         return _BernoulliCPT(_Conditional([condition], p_true, p_false))
 
-    # pair / letp
-    def pair(self, node1: BNNode, node2: BNNode) -> BNPair:
-        """
-        Creates a BNPair - corresponds to ⊗-introduction in λ!-calculus.
-
-            weather = bn.pair(rain, wind)   <->   (rain, wind) : B ⊗ B
-        """
-        return BNPair(node1, node2)
-
-    def letp(self, pair_expr: BNPair, body: Callable) -> "BNNode | BNPair":
-        """
-        Eliminates a BNPair - corresponds to letp in λ!-calculus.
-
-            letp (x, y) = e in f(x, y)
-
-        Usage:
-            wet = bn.letp(weather, lambda rain, wind:
-                      bn.sample("wet", bn.where(rain, 0.9, 0.01)))
-
-        Note: Python tuple destructuring (x, y = pair) is equivalent;
-              bn.letp() makes the correspondence with the paper explicit.
-        """
-        x, y = pair_expr
-        return body(x, y)
-
     # query
-    def query(self, target: str, evidence: Optional[dict] = None) -> dict:
+    def query(self, target: Union[str, list], evidence: Optional[dict] = None) -> dict:
         """
         Exact inference via LazyPropagation.
-        Returns the posterior distribution of target as dict label->prob.
-        Triggers compilation if still in DESIGN state.
+
+        target: a node name (str) or a list of node names.
+          - Single target  -> {label: prob}
+          - Multiple targets -> {node_name: {label: prob}}
+
+        evidence: {node_name: value}  (bool, int index, or label string)
+
+        Raises RuntimeError if called before bn.compile().
         """
         self._ensure_compiled()
         ie = gum.LazyPropagation(self._gum_bn)
@@ -532,6 +455,12 @@ class BNContext:
             ie.setEvidence(gum_ev)
 
         ie.makeInference()
+
+        if isinstance(target, str):
+            return self._posterior_dict(ie, target)
+        return {t: self._posterior_dict(ie, t) for t in target}
+
+    def _posterior_dict(self, ie, target: str) -> dict:
         target_full = target if target in self._gum_bn.names() \
                       else self._full_name(target)
         posterior = ie.posterior(target_full)
@@ -549,99 +478,6 @@ class BNContext:
                            self._gum_bn.variable(b).name())
                           for a, b in self._gum_bn.arcs()])
 
-    # factor semantics 
-    def _val_to_idx(self, node_name: str, val) -> int:
-        """Converts a user-provided value to a pyAgrum variable index."""
-        var  = self._gum_bn.variable(node_name)
-        node = self._nodes.get(node_name)
-        if isinstance(val, bool):
-            return 1 if val else 0
-        if isinstance(val, float) and node and node.is_continuous:
-            ticks = node.ticks
-            for i in range(len(ticks) - 1):
-                if ticks[i] <= val < ticks[i + 1]:
-                    return i
-            return len(ticks) - 2 # last bin (val == ticks[-1])
-        if isinstance(val, str):
-            return var.index(val)
-        return int(val)
-
-    def prob(self, assignment: dict) -> float:
-        """
-        Joint probability P(X₁=x1,...,Xn=xn) = ∏i P(Xi=xi | pa(Xi)).
-
-        This is the direct evaluation of the factor decomposition.
-        assignment: {node_name: value}  (bool, int index, float, or label string)
-        """
-        self._ensure_compiled()
-        p = 1.0
-        for node_name in self._gum_bn.names():
-            cpt      = self._gum_bn.cpt(node_name)
-            inst     = gum.Instantiation(cpt)
-            node_var = self._gum_bn.variable(node_name)
-            inst.chgVal(node_var, self._val_to_idx(node_name, assignment[node_name]))
-            node_id = self._gum_bn.idFromName(node_name)
-            for pid in self._gum_bn.parents(node_id):
-                pvar  = self._gum_bn.variable(pid)
-                pname = pvar.name()
-                if pname in assignment:
-                    inst.chgVal(pvar, self._val_to_idx(pname, assignment[pname]))
-            p_i = float(cpt[inst])
-            if p_i <= 0.0:
-                return 0.0
-            p *= p_i
-        return p
-
-    def log_prob(self, assignment: dict) -> float:
-        """
-        Log joint probability log P(X=x) = Σᵢ log P(Xᵢ=xᵢ | pa(Xᵢ)).
-        Returns -inf if any factor is zero.
-        """
-        self._ensure_compiled()
-        import math
-        lp = 0.0
-        for node_name in self._gum_bn.names():
-            cpt      = self._gum_bn.cpt(node_name)
-            inst     = gum.Instantiation(cpt)
-            node_var = self._gum_bn.variable(node_name)
-            inst.chgVal(node_var, self._val_to_idx(node_name, assignment[node_name]))
-            node_id = self._gum_bn.idFromName(node_name)
-            for pid in self._gum_bn.parents(node_id):
-                pvar  = self._gum_bn.variable(pid)
-                pname = pvar.name()
-                if pname in assignment:
-                    inst.chgVal(pvar, self._val_to_idx(pname, assignment[pname]))
-            p_i = float(cpt[inst])
-            if p_i <= 0.0:
-                return float('-inf')
-            lp += math.log(p_i)
-        return lp
-
-    def evidence_prob(self, evidence: Optional[dict] = None) -> float:
-        """
-        Marginal probability P(evidence) = Σ_{others} ∏ᵢ P(Xᵢ=xᵢ | pa(Xᵢ)).
-        Computed via Variable Elimination (pyAgrum LazyPropagation).
-
-        Useful for model comparison (Bayes factors: P(e|M₁)/P(e|M₂)).
-        Returns 1.0 if no evidence is provided.
-        """
-        self._ensure_compiled()
-        ie = gum.LazyPropagation(self._gum_bn)
-        if evidence:
-            gum_ev: dict = {}
-            for var_name, val in evidence.items():
-                full = var_name if var_name in self._gum_bn.names() \
-                       else self._full_name(var_name)
-                if isinstance(val, bool):
-                    gum_ev[full] = "True" if val else "False"
-                elif isinstance(val, (int, float)):
-                    gum_ev[full] = int(val)
-                else:
-                    gum_ev[full] = val
-            ie.setEvidence(gum_ev)
-        ie.makeInference()
-        return float(ie.evidenceProbability())
-
     @property
     def gum_bn(self) -> gum.BayesNet:
         self._ensure_compiled()
@@ -652,8 +488,7 @@ class BNContext:
         if self._state != COMPILED:
             raise RuntimeError(
                 "BN is not compiled yet. Call bn.compile() before using "
-                "query(), show(), prob(), log_prob(), evidence_prob(), "
-                "show_graph(), or gum_bn."
+                "query(), show(), show_graph(), or gum_bn."
             )
 
     def reopen(self) -> None:
@@ -813,34 +648,6 @@ class BNContext:
             print(f"- Per-node override: "
                   f"bn.sample('{top[0][1]}', ..., n_bins=5)")
 
-    # visualization: plate notation
-
-    def _parse_node_name(self, full_name: str):
-        """
-        Parses a node name into plate segments and local name.
-        "student_0/skill" -> ([("student", 0)], "skill")
-        "s_0/m_1/grade"   -> ([("s", 0), ("m", 1)], "grade")
-        """
-        parts = full_name.split('/')
-        segs = []
-        for part in parts[:-1]:
-            for pname in sorted(self._plates, key=len, reverse=True):
-                if part.startswith(pname + '_'):
-                    tail = part[len(pname) + 1:]
-                    try:
-                        segs.append((pname, int(tail)))
-                        break
-                    except ValueError:
-                        pass
-        return segs, parts[-1]
-
-    def _to_template(self, full_name: str) -> str:
-        """Returns the template name (all indices -> 0) of a node."""
-        segs, local = self._parse_node_name(full_name)
-        if not segs:
-            return full_name
-        return '/'.join(f"{p}_0" for p, _ in segs) + '/' + local
-
     def _cpt_summary(self, template_name: str) -> str:
         """Compact CPT summary for display (root nodes only)."""
         node = self._nodes.get(template_name)
@@ -879,59 +686,40 @@ class BNContext:
         import matplotlib.patches as mpatches
         from matplotlib.patches import FancyBboxPatch
 
-        # 1. Template graph
+        # Build node table — collapse plate groups (coin_1, coin_2 → coin_1 ×N)
         tmpl: dict[str, dict] = {}
         for full in self._gum_bn.names():
-            segs, local = self._parse_node_name(full)
-            if all(idx == 0 for _, idx in segs):
-                is_thunk = full in self._thunk_derived
-                tmpl[full] = dict(
-                    label   = f"!{local}" if is_thunk else local,
-                    is_thunk= is_thunk,
-                    plate   = segs[0][0] if segs else None,
-                    local   = local,
-                )
+            is_plate = full in self._plate_derived
+            tmpl[full] = dict(
+                label    = full,
+                is_plate = is_plate,
+                plate    = None,
+            )
 
-        # Virtual plates for thunk groups with multiple dereferences
-        # e.g. coin_1, coin_2 -> plate "coin ×2" showing only coin_1
-        thunk_remap: dict[str, str] = {}   # non-representative -> representative
-        for base_name, members in self._thunk_groups.items():
+        plate_remap: dict[str, str] = {}
+        plates_info: dict[str, dict] = {}
+        for base_name, members in self._plate_groups.items():
             in_tmpl = [m for m in members if m in tmpl]
             if len(in_tmpl) > 1:
                 rep = in_tmpl[0]
                 for m in in_tmpl[1:]:
-                    thunk_remap[m] = rep
+                    plate_remap[m] = rep
                     del tmpl[m]
                 tmpl[rep]["plate"] = base_name
-                tmpl[rep]["label"] = f"!{base_name}"
+                tmpl[rep]["label"] = base_name
+                plates_info[base_name] = {"size": len(members), "members": [rep]}
 
-        # Arcs (after thunk remap so non-representative nodes are already removed)
         def _resolve(n: str) -> str:
-            return thunk_remap.get(n, self._to_template(n))
+            return plate_remap.get(n, n)
 
         arcs: list[tuple] = []
-        seen_arcs: set    = set()
+        seen_arcs: set = set()
         for a, b in self._gum_bn.arcs():
             s = _resolve(self._gum_bn.variable(a).name())
             d = _resolve(self._gum_bn.variable(b).name())
             if (s, d) not in seen_arcs and s in tmpl and d in tmpl:
                 seen_arcs.add((s, d))
                 arcs.append((s, d))
-
-        # Plates from bn.plate()
-        plates_info = {
-            pn: {"size": sz,
-                 "members": [n for n, v in tmpl.items() if v["plate"] == pn]}
-            for pn, sz in self._plates.items()
-            if any(v["plate"] == pn for v in tmpl.values())
-        }
-        # Add virtual plates from thunk groups
-        for base_name, members in self._thunk_groups.items():
-            if len(members) > 1:
-                rep_list = [m for m in [members[0]] if m in tmpl]
-                if rep_list:
-                    plates_info[base_name] = {"size": len(members),
-                                               "members": rep_list}
 
         # 2. Layout: topological levels
         children = {n: [] for n in tmpl}
@@ -965,7 +753,7 @@ class BNContext:
         X_STEP, Y_STEP = 3.5, 1.8
         pos: dict[str, tuple] = {}
         for lv, nodes in by_level.items():
-            nodes_s = sorted(nodes, key=lambda n: (tmpl[n]["plate"] or "", n))
+            nodes_s = sorted(nodes, key=lambda n: (tmpl[n]["plate"] or "", n))  # noqa: B023
             y0 = (len(nodes_s) - 1) * Y_STEP / 2
             for i, n in enumerate(nodes_s):
                 pos[n] = (lv * X_STEP, y0 - i * Y_STEP)
@@ -1033,7 +821,7 @@ class BNContext:
         # nodes
         for n, data in tmpl.items():
             x, y = pos[n]
-            color = C_THUNK if data["is_thunk"] else C_ROOT
+            color = C_THUNK if data["is_plate"] else C_ROOT
             ell = mpatches.Ellipse((x, y), 2 * RX, 2 * RY,
                                     facecolor=color, edgecolor="#2C3E50",
                                     linewidth=1.5, zorder=3)
@@ -1065,8 +853,6 @@ class BNContext:
 
     # internal methods: base nodes
     def _full_name(self, name: str) -> str:
-        if self._plate_prefix:
-            return "/".join(self._plate_prefix) + "/" + name
         return name
 
     def _add_bernoulli_root(self, name: str, p: float) -> BNNode:

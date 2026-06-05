@@ -35,6 +35,7 @@ import torch
 import pyro.distributions as dist
 import pyagrum as gum
 import numpy as np
+from dataclasses import dataclass, field
 from itertools import product as iproduct
 from typing import Optional, Callable, Union
 
@@ -43,6 +44,16 @@ from typing import Optional, Callable, Union
 
 MIDPOINT    = "midpoint"
 INTEGRATION = "integration"
+
+# CONSTANTS: BNContext states
+
+DESIGN   = "design"
+COMPILED = "compiled"
+
+# CONSTANTS: bin strategies
+
+BIN_UNIFORM  = "uniform"    # all nodes get n_bins (default)
+BIN_ADAPTIVE = "adaptive"   # fewer bins for nodes with many continuous parents
 
 
 # Utilities
@@ -58,13 +69,13 @@ def _get_dist_range(distribution) -> tuple[float, float]:
 
     if isinstance(distribution, dist.Beta):
         a, b = _f(distribution.concentration1), _f(distribution.concentration0)
-        mu    = a / (a + b)
+        mu = a / (a + b)
         sigma = np.sqrt(a * b / ((a + b) ** 2 * (a + b + 1)))
         return max(0.001, mu - 3 * sigma), min(0.999, mu + 3 * sigma)
 
     if isinstance(distribution, dist.Gamma):
         a, r  = _f(distribution.concentration), _f(distribution.rate)
-        mu    = a / r
+        mu = a / r
         sigma = np.sqrt(a) / r
         return max(0.001, mu - 3 * sigma), mu + 3 * sigma
 
@@ -104,14 +115,16 @@ def _discretize_continuous(name: str, distribution, n_bins: int = 10):
 class BNNode:
     """A random variable node in a BNContext."""
 
-    def __init__(self, name: str, is_continuous: bool = False,
-                 ticks: Optional[np.ndarray] = None):
-        self.name          = name
+    def __init__(self, name: str, is_continuous: bool = False, ticks: Optional[np.ndarray] = None):
+        self.name = name
         self.is_continuous = is_continuous
-        self.ticks         = ticks
+        self.ticks = ticks
 
     def __repr__(self):
-        kind = "continuous" if self.is_continuous else "discrete"
+        if self.is_continuous is None:
+            kind = "pending"
+        else:
+            kind = "continuous" if self.is_continuous else "discrete"
         return f"BNNode({self.name!r}, {kind})"
 
     def __bool__(self):
@@ -132,7 +145,7 @@ class BNThunk:
 
     def __init__(self, ctx: "BNContext", base_name: str,
                  dist_or_fn, fn_parents: Optional[list] = None):
-        self._ctx        = ctx
+        self._ctx  = ctx
         self._base_name  = base_name
         self._dist_or_fn = dist_or_fn
         self._fn_parents = fn_parents or []
@@ -141,21 +154,15 @@ class BNThunk:
     def __call__(self, name: Optional[str] = None) -> BNNode:
         self._call_count += 1
         node_name = name or f"{self._base_name}_{self._call_count}"
-        full_name = self._ctx._full_name(node_name)
         d = self._dist_or_fn
 
         if self._fn_parents and callable(d) and not isinstance(d, _BernoulliCPT):
-            # Parametric thunk: lambda + explicit parents
-            node = self._ctx._add_from_fn(full_name, d, self._fn_parents)
-        elif isinstance(d, _BernoulliCPT):
-            node = self._ctx._add_bernoulli_cpt(full_name, d.cond)
-        elif isinstance(d, dist.Bernoulli):
-            p = float(d.probs.item() if hasattr(d.probs, "item") else d.probs)
-            node = self._ctx._add_bernoulli_root(full_name, p)
+            node = self._ctx.sample(node_name, d, parents=self._fn_parents)
         else:
-            node = self._ctx._add_continuous(full_name, d)
+            node = self._ctx.sample(node_name, d)
 
-        self._ctx._thunk_derived.add(full_name)
+        # Track thunk metadata immediately (used by show_graph)
+        self._ctx._thunk_derived.add(node.name)
         self._ctx._thunk_groups.setdefault(self._base_name, []).append(node.name)
         return node
 
@@ -199,7 +206,7 @@ class _BernoulliCPT:
 class _Conditional:
     def __init__(self, parents: list[BNNode], p_true, p_false):
         self.parents = parents
-        self.p_true  = p_true
+        self.p_true = p_true
         self.p_false = p_false
 
 def _collect_parents(cond: "_Conditional") -> list[BNNode]:
@@ -234,13 +241,25 @@ def _eval_cond(cond: "_Conditional", assignment: dict) -> float:
     return float(branch)
 
 
+@dataclass
+class _NodeSpec:
+    """Pending node declaration stored during the DESIGN phase."""
+    name: str # full node name (with plate prefix)
+    dist_or_fn: object # distribution, _BernoulliCPT, or callable
+    parents: list # list[BNNode] stubs (resolved at compile time)
+    node: "BNNode" # stub returned to the user
+    is_thunk_derived: bool = False
+    thunk_base_name: str = None
+    n_bins_override: Optional[int] = None  # per-node bin count (overrides strategy)
+
+
 # Plate iterator
 
 class _PlateIterator:
     """Iterator for bn.plate(): prefixes node names at each iteration."""
 
     def __init__(self, ctx: "BNContext", name: str, size: int):
-        self._ctx  = ctx
+        self._ctx = ctx
         self._name = name
         self._size = size
 
@@ -285,19 +304,45 @@ class BNContext:
         p = bn.query("rain", evidence={"wet": True})
     """
 
-    def __init__(self, n_bins: int = 10, discretization_method: str = MIDPOINT):
+    def __init__(self, n_bins: int = 10,
+                 discretization_method: str = MIDPOINT,
+                 bin_strategy: str = BIN_UNIFORM,
+                 memory_warn_mb: float = 50.0,
+                 memory_limit_mb: Optional[float] = None):
+        """
+        Parameters
+        ----------
+        n_bins               : default number of bins for continuous nodes
+        discretization_method: MIDPOINT (fast) or INTEGRATION (precise)
+        bin_strategy         : BIN_UNIFORM (all nodes same) or BIN_ADAPTIVE
+                               (fewer bins for nodes with many continuous parents)
+        memory_warn_mb       : print a warning if total CPT size exceeds this (MB)
+        memory_limit_mb      : raise RuntimeError if total CPT size exceeds this (MB).
+                               None = no hard limit.
+        """
         if discretization_method not in (MIDPOINT, INTEGRATION):
             raise ValueError(
                 f"discretization_method must be '{MIDPOINT}' or '{INTEGRATION}'"
             )
-        self._gum_bn               = gum.BayesNet("HigherOrderBN")
-        self._nodes: dict[str, BNNode] = {}
-        self._n_bins               = n_bins
+        if bin_strategy not in (BIN_UNIFORM, BIN_ADAPTIVE):
+            raise ValueError(
+                f"bin_strategy must be '{BIN_UNIFORM}' or '{BIN_ADAPTIVE}'"
+            )
+        # DESIGN state 
+        self._state: str = DESIGN
+        self._specs: list[_NodeSpec] = []
+        self._n_bins: int = n_bins
+        self._bin_strategy:    str             = bin_strategy
+        self._memory_warn_mb:  float           = memory_warn_mb
+        self._memory_limit_mb: Optional[float] = memory_limit_mb
         self._plate_prefix: list[str] = []
-        self._discretization_method = discretization_method
-        self._plates: dict[str, int] = {}             # {plate_name: size}
-        self._thunk_derived: set[str] = set()         # node names created by thunk()()
-        self._thunk_groups: dict[str, list[str]] = {} # {base_name: [node_name, ...]}
+        self._discretization_method: str = discretization_method
+        self._plates: dict[str, int] = {}
+        self._thunk_derived: set[str] = set()
+        self._thunk_groups:  dict[str, list] = {}
+        # COMPILED state (populated by compile()) 
+        self._gum_bn: Optional[gum.BayesNet] = None
+        self._nodes:  dict[str, BNNode] = {}
 
     # To change de discretization method after construction
     @property
@@ -313,39 +358,40 @@ class BNContext:
         self._discretization_method = value
 
     # sample
-    def sample(self, name: str,
-               distribution_or_fn: Union[object, Callable],
-               parents: Optional[list[BNNode]] = None) -> BNNode:
+    def sample(self, name: str, distribution_or_fn: Union[object, Callable], parents: Optional[list[BNNode]] = None, n_bins: Optional[int] = None) -> BNNode:
         """
-        Creates a node in the BN.
+        Declares a random variable node (DESIGN phase).
+        The pyAgrum node is created lazily at compile() time.
+
+        Raises RuntimeError if called in COMPILED state — call reopen() first.
+
+        n_bins: optional per-node bin count override (continuous nodes only).
+                Overrides both the global n_bins and the bin_strategy.
 
         Supported cases:
             bn.sample("rain", dist.Bernoulli(0.2))
             bn.sample("wet",  bn.where(rain, 0.9, 0.01))
+            bn.sample("cat",  dist.Categorical(torch.tensor([0.3, 0.4, 0.3])))
             bn.sample("temp", dist.Normal(20.0, 5.0))
+            bn.sample("temp", dist.Normal(20.0, 5.0), n_bins=20)
             bn.sample("x", lambda mu: dist.Normal(mu, 1.0), parents=[mu_node])
-            bn.sample("x", lambda mu, nu: dist.Normal(mu, nu),parents=[mu_node, nu_node])
+            bn.sample("x", lambda mu, nu: dist.Normal(mu, nu), parents=[mu_node, nu_node])
         """
+        if self._state == COMPILED:
+            raise RuntimeError(
+                "Cannot declare nodes on a compiled BN. "
+                "Call bn.reopen() first to return to DESIGN state."
+            )
         full_name = self._full_name(name)
-
-        # Callable + parents -> probe return type and route
-        if callable(distribution_or_fn) and parents is not None:
-            return self._add_from_fn(full_name, distribution_or_fn, parents)
-
-        d = distribution_or_fn
-
-        if isinstance(d, _BernoulliCPT):
-            return self._add_bernoulli_cpt(full_name, d.cond)
-
-        if isinstance(d, dist.Bernoulli):
-            p = float(d.probs.item() if hasattr(d.probs, "item") else d.probs)
-            return self._add_bernoulli_root(full_name, p)
-
-        if isinstance(d, dist.Categorical):
-            return self._add_categorical_root(full_name, d.probs.tolist())
-
-        # All other distributions treated as continuous (with fallback discretization)
-        return self._add_continuous(full_name, d)
+        stub = BNNode(full_name, is_continuous=None, ticks=None)
+        self._specs.append(_NodeSpec(
+            name=full_name,
+            dist_or_fn=distribution_or_fn,
+            parents=list(parents) if parents else [],
+            node=stub,
+            n_bins_override=n_bins,
+        ))
+        return stub
 
     # thunk
     def thunk(self, name: str, distribution_or_fn,
@@ -406,9 +452,9 @@ class BNContext:
         """
         nodes: list[BNNode] = []
         for i in range(n_steps):
-            prev      = nodes[-1] if nodes else None
+            prev = nodes[-1] if nodes else None
             node_name = f"{name}_{i}"
-            d_or_fn   = step_fn(i, prev)
+            d_or_fn = step_fn(i, prev)
             if callable(d_or_fn) and not isinstance(d_or_fn, _BernoulliCPT) and prev is not None:
                 node = self.sample(node_name, d_or_fn, parents=[prev])
             else:
@@ -467,7 +513,9 @@ class BNContext:
         """
         Exact inference via LazyPropagation.
         Returns the posterior distribution of target as dict label->prob.
+        Triggers compilation if still in DESIGN state.
         """
+        self._ensure_compiled()
         ie = gum.LazyPropagation(self._gum_bn)
 
         if evidence:
@@ -487,21 +535,21 @@ class BNContext:
         target_full = target if target in self._gum_bn.names() \
                       else self._full_name(target)
         posterior = ie.posterior(target_full)
-        var       = self._gum_bn.variable(target_full)
+        var = self._gum_bn.variable(target_full)
         return {var.label(i): float(posterior[{target_full: i}])
                 for i in range(var.domainSize())}
 
     def show(self):
-        print(f"\nBN compilé : {len(self._gum_bn.nodes())} noeuds, "
+        self._ensure_compiled()
+        print(f"\nBN compiled : {len(self._gum_bn.nodes())} nodes, "
               f"{len(self._gum_bn.arcs())} arcs  "
-              f"[méthode={self._discretization_method}]")
-        print("Nœuds :", list(self._gum_bn.names()))
+              f"[method={self._discretization_method}]")
+        print("Nodes :", list(self._gum_bn.names()))
         print("Arcs  :", [(self._gum_bn.variable(a).name(),
                            self._gum_bn.variable(b).name())
                           for a, b in self._gum_bn.arcs()])
 
     # factor semantics 
-
     def _val_to_idx(self, node_name: str, val) -> int:
         """Converts a user-provided value to a pyAgrum variable index."""
         var  = self._gum_bn.variable(node_name)
@@ -513,18 +561,19 @@ class BNContext:
             for i in range(len(ticks) - 1):
                 if ticks[i] <= val < ticks[i + 1]:
                     return i
-            return len(ticks) - 2   # last bin (val == ticks[-1])
+            return len(ticks) - 2 # last bin (val == ticks[-1])
         if isinstance(val, str):
             return var.index(val)
         return int(val)
 
     def prob(self, assignment: dict) -> float:
         """
-        Joint probability P(X₁=x₁,...,Xₙ=xₙ) = ∏ᵢ P(Xᵢ=xᵢ | pa(Xᵢ)).
+        Joint probability P(X₁=x1,...,Xn=xn) = ∏i P(Xi=xi | pa(Xi)).
 
         This is the direct evaluation of the factor decomposition.
         assignment: {node_name: value}  (bool, int index, float, or label string)
         """
+        self._ensure_compiled()
         p = 1.0
         for node_name in self._gum_bn.names():
             cpt      = self._gum_bn.cpt(node_name)
@@ -548,6 +597,7 @@ class BNContext:
         Log joint probability log P(X=x) = Σᵢ log P(Xᵢ=xᵢ | pa(Xᵢ)).
         Returns -inf if any factor is zero.
         """
+        self._ensure_compiled()
         import math
         lp = 0.0
         for node_name in self._gum_bn.names():
@@ -575,6 +625,7 @@ class BNContext:
         Useful for model comparison (Bayes factors: P(e|M₁)/P(e|M₂)).
         Returns 1.0 if no evidence is provided.
         """
+        self._ensure_compiled()
         ie = gum.LazyPropagation(self._gum_bn)
         if evidence:
             gum_ev: dict = {}
@@ -593,7 +644,174 @@ class BNContext:
 
     @property
     def gum_bn(self) -> gum.BayesNet:
+        self._ensure_compiled()
         return self._gum_bn
+
+    # compilation 
+    def _ensure_compiled(self) -> None:
+        if self._state != COMPILED:
+            raise RuntimeError(
+                "BN is not compiled yet. Call bn.compile() before using "
+                "query(), show(), prob(), log_prob(), evidence_prob(), "
+                "show_graph(), or gum_bn."
+            )
+
+    def reopen(self) -> None:
+        """
+        Transitions COMPILED -> DESIGN.
+
+        Discards the compiled pyAgrum BN (freeing memory) while keeping all
+        existing node specs. A subsequent compile() or query() will rebuild
+        the BN from scratch, which is useful after changing n_bins or
+        discretization_method, or after adding new nodes.
+
+        Example:
+            bn.compile()                       # DESIGN -> COMPILED
+            bn.reopen()                        # COMPILED -> DESIGN
+            extra = bn.sample("extra", ...)    # add a node
+            p = bn.query("extra")              # auto-recompiles
+        """
+        if self._state == DESIGN:
+            return   # already in DESIGN, nothing to do
+        self._gum_bn = None
+        self._nodes = {}
+        self._state = DESIGN
+
+    def _resolve_n_bins(self, spec: _NodeSpec) -> int:
+        """
+        Returns the number of bins to use for a given node spec.
+
+        Priority:
+          1. Per-node override: bn.sample(..., n_bins=20)
+          2. BIN_ADAPTIVE strategy: reduce bins based on continuous parent count
+          3. Global self._n_bins (BIN_UNIFORM, default)
+
+        BIN_ADAPTIVE formula:
+            0 continuous parents -> n_bins
+            1 continuous parent  -> n_bins        (same, 1 parent is manageable)
+            2 continuous parents -> n_bins // 2
+            3 continuous parents -> n_bins // 4
+            k continuous parents -> max(3, n_bins // 2^(k-1))
+        """
+        if spec.n_bins_override is not None:
+            return spec.n_bins_override
+
+        if self._bin_strategy == BIN_ADAPTIVE:
+            n_cont = sum(1 for p in spec.parents if p.is_continuous is True)
+            if n_cont > 1:
+                return max(3, self._n_bins // (2 ** (n_cont - 1)))
+
+        return self._n_bins
+
+    def compile(self) -> None:
+        """
+        Transitions DESIGN -> COMPILED.
+
+        Processes all pending _NodeSpec declarations in topological order
+        (declaration order = topological order by construction), builds the
+        pyAgrum BayesNet, fills all CPTs, then checks memory usage.
+
+        For each node, _resolve_n_bins() determines the effective bin count
+        based on the bin_strategy and any per-node n_bins override.
+        """
+        if self._state == COMPILED:
+            return
+
+        self._gum_bn = gum.BayesNet("HigherOrderBN")
+        self._nodes  = {}
+
+        for spec in self._specs:
+            d  = spec.dist_or_fn
+            parents = spec.parents
+            name = spec.name
+
+            # Temporarily override self._n_bins for this node's compilation
+            saved_n_bins = self._n_bins
+            self._n_bins = self._resolve_n_bins(spec)
+
+            if callable(d) and parents:
+                compiled = self._add_from_fn(name, d, parents)
+            elif isinstance(d, _BernoulliCPT):
+                compiled = self._add_bernoulli_cpt(name, d.cond)
+            elif isinstance(d, dist.Bernoulli):
+                p = float(d.probs.item() if hasattr(d.probs, "item") else d.probs)
+                compiled = self._add_bernoulli_root(name, p)
+            elif isinstance(d, dist.Categorical):
+                compiled = self._add_categorical_root(name, d.probs.tolist())
+            else:
+                compiled = self._add_continuous(name, d)
+
+            self._n_bins = saved_n_bins   # restore
+
+            spec.node.is_continuous = compiled.is_continuous
+            spec.node.ticks = compiled.ticks
+
+        self._check_memory()
+        self._state = COMPILED
+
+    def _check_memory(self) -> None:
+        """
+        Prints a compilation summary and checks memory usage.
+
+        - Always prints total nodes, arcs, CPT entries and estimated memory.
+        - Prints per-node breakdown if any node exceeds memory_warn_mb / 4.
+        - Warns if total exceeds memory_warn_mb.
+        - Raises RuntimeError if total exceeds memory_limit_mb (hard limit).
+        """
+        # Per-node CPT sizes 
+        node_entries: list[tuple[int, str]] = []   # (entries, name)
+        for name in self._gum_bn.names():
+            node_id = self._gum_bn.idFromName(name)
+            var_size = self._gum_bn.variable(name).domainSize()
+            parent_sz = 1
+            for pid in self._gum_bn.parents(node_id):
+                parent_sz *= self._gum_bn.variable(pid).domainSize()
+            node_entries.append((var_size * parent_sz, name))
+
+        total_entries = sum(e for e, _ in node_entries)
+        mem_mb = total_entries * 8 / 1e6   # float64 = 8 bytes
+        n_nodes = len(self._gum_bn.nodes())
+
+        # Summary line 
+        print(f"\nBN compiled : {n_nodes} nodes, "
+              f"{len(self._gum_bn.arcs())} arcs, "
+              f"{total_entries:,} CPT entries ({mem_mb:.1f} MB)"
+              f"  [n_bins={self._n_bins}, strategy={self._bin_strategy},"
+              f" method={self._discretization_method}]")
+
+        # Hard limit: raise before doing anything else 
+        if self._memory_limit_mb is not None and mem_mb > self._memory_limit_mb:
+            top = sorted(node_entries, reverse=True)[:3]
+            top_str = ", ".join(
+                f"{n} ({e:,} entries)" for e, n in top
+            )
+            raise RuntimeError(
+                f"Compilation aborted: BN requires {mem_mb:.1f} MB "
+                f"which exceeds memory_limit_mb={self._memory_limit_mb} MB.\n"
+                f"Largest nodes: {top_str}\n"
+                f"Suggestions:\n"
+                f"- Reduce n_bins (currently {self._n_bins})\n"
+                f"- Use bin_strategy=BIN_ADAPTIVE\n"
+                f"- Use per-node override: bn.sample(..., n_bins=5)"
+            )
+
+        # Soft warning 
+        if mem_mb > self._memory_warn_mb:
+            top = sorted(node_entries, reverse=True)[:3]
+            print(f"[WARN] Large BN ({mem_mb:.0f} MB > warn threshold "
+                  f"{self._memory_warn_mb:.0f} MB).")
+            print(f"Top-3 nodes by CPT size:")
+            for entries, name in top:
+                n_parents = len(list(self._gum_bn.parents(
+                    self._gum_bn.idFromName(name))))
+                print(f"{name:30s}  {entries:>8,} entries  "
+                      f"({n_parents} parents)")
+            print(f"Suggestions:")
+            print(f"- Reduce n_bins (currently {self._n_bins})")
+            if self._bin_strategy == BIN_UNIFORM:
+                print(f"- Switch to bin_strategy=BIN_ADAPTIVE")
+            print(f"- Per-node override: "
+                  f"bn.sample('{top[0][1]}', ..., n_bins=5)")
 
     # visualization: plate notation
 
@@ -604,7 +822,7 @@ class BNContext:
         "s_0/m_1/grade"   -> ([("s", 0), ("m", 1)], "grade")
         """
         parts = full_name.split('/')
-        segs  = []
+        segs = []
         for part in parts[:-1]:
             for pname in sorted(self._plates, key=len, reverse=True):
                 if part.startswith(pname + '_'):
@@ -634,8 +852,8 @@ class BNContext:
         if self._gum_bn.parents(node_id):
             return ""   # too complex to summarize
         try:
-            var  = self._gum_bn.variable(template_name)
-            cpt  = self._gum_bn.cpt(template_name)
+            var = self._gum_bn.variable(template_name)
+            cpt = self._gum_bn.cpt(template_name)
             inst = gum.Instantiation(cpt)
             inst.setFirst()
             vals = []
@@ -651,10 +869,12 @@ class BNContext:
     def show_graph(self, show_cpt: bool = False, figsize: tuple = (14, 8)) -> None:
         """
         Displays the BN in plate notation (template view) using matplotlib.
+        Triggers compilation if still in DESIGN state.
 
         show_cpt : display P(X=True) under Bernoulli root nodes.
         figsize  : matplotlib figure size.
         """
+        self._ensure_compiled()
         import matplotlib.pyplot as plt
         import matplotlib.patches as mpatches
         from matplotlib.patches import FancyBboxPatch
@@ -673,7 +893,7 @@ class BNContext:
                 )
 
         # Virtual plates for thunk groups with multiple dereferences
-        # e.g. coin_1, coin_2 → plate "coin ×2" showing only coin_1
+        # e.g. coin_1, coin_2 -> plate "coin ×2" showing only coin_1
         thunk_remap: dict[str, str] = {}   # non-representative -> representative
         for base_name, members in self._thunk_groups.items():
             in_tmpl = [m for m in members if m in tmpl]
@@ -1068,7 +1288,7 @@ class BNContext:
 
         For each bin of X:
             P(X in [x_lo, x_hi] | Y in [y_lo, y_hi])
-                = (1/|bin_Y|) * integral_{y_lo}^{y_hi} [CDF(x_hi|y) - CDF(x_lo|y)] dy
+    = (1/|bin_Y|) * integral_{y_lo}^{y_hi} [CDF(x_hi|y) - CDF(x_lo|y)] dy
 
         More accurate than midpoint for coarse bins.
         Discrete parents are treated as in midpoint (fixed value).
@@ -1077,12 +1297,12 @@ class BNContext:
         from scipy.integrate import nquad, IntegrationWarning
         warnings.filterwarnings("ignore", category=IntegrationWarning)
 
-        n_bins_x         = len(x_ticks) - 1
+        n_bins_x   = len(x_ticks) - 1
         cont_indices     = [i for i, info in enumerate(parent_combo) if info[3]]
         cont_indices_set = set(cont_indices)
-        disc_vals        = {i: info[2] for i, info in enumerate(parent_combo)
+        disc_vals  = {i: info[2] for i, info in enumerate(parent_combo)
                             if not info[3]}
-        ranges           = [(parent_combo[i][0], parent_combo[i][1])
+        ranges     = [(parent_combo[i][0], parent_combo[i][1])
                             for i in cont_indices]
 
         # No continuous parents: same as midpoint

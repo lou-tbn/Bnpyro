@@ -261,7 +261,8 @@ class BNppl:
                  discretization_method: str = MIDPOINT,
                  bin_strategy: str = BIN_UNIFORM,
                  memory_warn_mb: float = 50.0,
-                 memory_limit_mb: Optional[float] = None):
+                 memory_limit_mb: Optional[float] = None,
+                 name: str = "BN"):
         """
         Parameters
         ----------
@@ -281,8 +282,9 @@ class BNppl:
             raise ValueError(
                 f"bin_strategy must be '{BIN_UNIFORM}' or '{BIN_ADAPTIVE}'"
             )
-        # DESIGN state 
+        # DESIGN state
         self._state: str = DESIGN
+        self._name: str = name
         self._specs: list[_NodeSpec] = []
         self._n_bins: int = n_bins
         self._bin_strategy: str = bin_strategy
@@ -609,7 +611,7 @@ class BNppl:
         if self._state == COMPILED:
             return
 
-        self._gum_bn = gum.BayesNet("HigherOrderBN")
+        self._gum_bn = gum.BayesNet(self._name)
         self._nodes  = {}
 
         for spec in self._specs:
@@ -730,28 +732,33 @@ class BNppl:
         except Exception:
             return ""
 
-    def show_graph(self, show_cpt: bool = False, figsize: tuple = (14, 8)) -> None:
+    def show_graph(self, show_cpt: bool = False) -> None:
         """
-        Displays the BN in plate notation (template view) using matplotlib.
+        Displays the BN using graphviz (dot layout).
         Triggers compilation if still in DESIGN state.
 
-        show_cpt : display P(X=True) under Bernoulli root nodes.
-        figsize  : matplotlib figure size.
+        show_cpt : show CPT summary under root nodes.
+
+        Requires: pip install graphviz  (+ graphviz binaries on PATH)
         """
         self._ensure_compiled()
-        import matplotlib.pyplot as plt
-        import matplotlib.patches as mpatches
-        from matplotlib.patches import FancyBboxPatch
+        try:
+            import graphviz
+        except ImportError:
+            raise ImportError(
+                "graphviz package not found — pip install graphviz\n"
+                "Also install the graphviz binaries: https://graphviz.org/download/"
+            )
 
-        # Build node table — collapse plate groups (coin_1, coin_2 → coin_1 ×N)
+        C_DISC  = "#AED6F1"   # light blue  — discrete / continuous nodes
+        C_PLATE = "#FAD7A0"   # light orange — plate-derived nodes
+        C_BOX   = "#EBF5FB"   # very light blue — plate cluster background
+        C_EDGE  = "#2874A6"   # dark blue   — cluster border
+
+        # collapse plate groups: coin_1/coin_2/... → one representative node
         tmpl: dict[str, dict] = {}
         for full in self._gum_bn.names():
-            is_plate = full in self._plate_derived
-            tmpl[full] = dict(
-                label    = full,
-                is_plate = is_plate,
-                plate    = None,
-            )
+            tmpl[full] = {"label": full, "is_plate": full in self._plate_derived}
 
         plate_remap: dict[str, str] = {}
         plates_info: dict[str, dict] = {}
@@ -762,9 +769,8 @@ class BNppl:
                 for m in in_tmpl[1:]:
                     plate_remap[m] = rep
                     del tmpl[m]
-                tmpl[rep]["plate"] = base_name
                 tmpl[rep]["label"] = base_name
-                plates_info[base_name] = {"size": len(members), "members": [rep]}
+                plates_info[base_name] = {"size": len(members), "rep": rep}
 
         def _resolve(n: str) -> str:
             return plate_remap.get(n, n)
@@ -778,140 +784,47 @@ class BNppl:
                 seen_arcs.add((s, d))
                 arcs.append((s, d))
 
-        # 2. Layout: topological levels
-        children = {n: [] for n in tmpl}
-        in_deg   = {n: 0  for n in tmpl}
-        for s, d in arcs:
-            children[s].append(d)
-            in_deg[d] += 1
+        g = graphviz.Digraph(name=self._name)
+        g.attr(rankdir="LR", fontname="Helvetica", fontsize="11", bgcolor="white")
+        g.attr("node", fontname="Helvetica", fontsize="11",
+               style="filled", shape="ellipse", margin="0.15,0.08",
+               penwidth="1.5", color="#2C3E50")
+        g.attr("edge", arrowsize="0.8", color="#2C3E50", penwidth="1.2")
 
-        level: dict[str, int] = {}
-        queue = [n for n in tmpl if in_deg[n] == 0]
-        for n in queue:
-            level[n] = 0
-        visited = set(queue)
-        while queue:
-            nxt = []
-            for n in queue:
-                for c in children[n]:
-                    level[c] = max(level.get(c, 0), level[n] + 1)
-                    if c not in visited:
-                        visited.add(c)
-                        nxt.append(c)
-            queue = nxt
-        for n in tmpl:
-            if n not in level:
-                level[n] = 0
+        nodes_in_cluster: set[str] = set()
+        for base_name, info in plates_info.items():
+            rep = info["rep"]
+            nodes_in_cluster.add(rep)
+            lbl = tmpl[rep]["label"]
+            if show_cpt:
+                cpt_str = self._cpt_summary(rep)
+                if cpt_str:
+                    lbl = f"{lbl}\n{cpt_str}"
+            with g.subgraph(name=f"cluster_{base_name}") as c:
+                c.attr(label=f"{base_name}  ×{info['size']}",
+                       style="filled", fillcolor=C_BOX,
+                       color=C_EDGE, fontsize="9", fontname="Helvetica",
+                       fontcolor=C_EDGE)
+                c.node(rep, label=lbl, fillcolor=C_PLATE)
 
-        by_level: dict[int, list] = {}
-        for n, lv in level.items():
-            by_level.setdefault(lv, []).append(n)
-
-        X_STEP, Y_STEP = 3.5, 1.8
-        pos: dict[str, tuple] = {}
-        for lv, nodes in by_level.items():
-            nodes_s = sorted(nodes, key=lambda n: (tmpl[n]["plate"] or "", n))  # noqa: B023
-            y0 = (len(nodes_s) - 1) * Y_STEP / 2
-            for i, n in enumerate(nodes_s):
-                pos[n] = (lv * X_STEP, y0 - i * Y_STEP)
-
-        # 3. Drawing
-        fig, ax = plt.subplots(figsize=figsize)
-        ax.set_aspect('equal')
-        ax.axis('off')
-
-        RX, RY = 0.65, 0.38     # ellipse semi-axes
-        PAD    = 0.55            # margin around plate members
-
-        C_ROOT  = "#AED6F1"
-        C_THUNK = "#FAD7A0"
-        C_PLATE = "#EBF5FB"
-        C_EDGE  = "#2874A6"
-
-        # plate rectangles
-        for pn, info in plates_info.items():
-            mems = info["members"]
-            if not mems:
-                continue
-            xs = [pos[n][0] for n in mems]
-            ys = [pos[n][1] for n in mems]
-            x0 = min(xs) - RX - PAD
-            y0 = min(ys) - RY - PAD
-            w  = max(xs) + RX + PAD - x0
-            h  = max(ys) + RY + PAD - y0
-            rect = FancyBboxPatch((x0, y0), w, h,
-                                   boxstyle="round,pad=0.1",
-                                   linewidth=1.8, edgecolor=C_EDGE,
-                                   facecolor=C_PLATE, zorder=1)
-            ax.add_patch(rect)
-            ax.text(x0 + w - 0.1, y0 + h - 0.1,
-                    f"{pn}  ×{info['size']}",
-                    ha='right', va='top', fontsize=9,
-                    color=C_EDGE, style='italic', zorder=4)
-
-        # arcs
-        def _ellipse_offset(rx, ry, vx, vy):
-            L = (vx**2 + vy**2) ** 0.5
-            if L < 1e-9:
-                return 0.0
-            ux, uy = vx / L, vy / L
-            return 1.0 / ((ux / rx) ** 2 + (uy / ry) ** 2) ** 0.5
-
-        for s, d in arcs:
-            sx, sy = pos[s]
-            dx, dy = pos[d]
-            vx, vy = dx - sx, dy - sy
-            L = (vx**2 + vy**2) ** 0.5
-            if L < 1e-6:
-                continue
-            off_s = _ellipse_offset(RX, RY,  vx,  vy)
-            off_d = _ellipse_offset(RX, RY, -vx, -vy)
-            xs_  = sx + vx / L * off_s
-            ys_  = sy + vy / L * off_s
-            xd_  = dx - vx / L * off_d
-            yd_  = dy - vy / L * off_d
-            # curve skip arcs (level diff > 1) so they don't pass through intermediate nodes
-            skip = abs(level.get(d, 0) - level.get(s, 0)) > 1
-            rad  = 0.35 if skip else 0.0
-            conn = f"arc3,rad={rad}" if rad else "arc3,rad=0"
-            ax.annotate("", xy=(xd_, yd_), xytext=(xs_, ys_),
-                        arrowprops=dict(arrowstyle="-|>", color="#2C3E50",
-                                        lw=1.5, mutation_scale=16,
-                                        connectionstyle=conn),
-                        zorder=2)
-
-        # nodes
         for n, data in tmpl.items():
-            x, y = pos[n]
-            color = C_THUNK if data["is_plate"] else C_ROOT
-            ell = mpatches.Ellipse((x, y), 2 * RX, 2 * RY,
-                                    facecolor=color, edgecolor="#2C3E50",
-                                    linewidth=1.5, zorder=3)
-            ax.add_patch(ell)
-            label = data["label"]
+            if n in nodes_in_cluster:
+                continue
+            lbl = data["label"]
             if show_cpt:
                 cpt_str = self._cpt_summary(n)
-                ax.text(x, y + 0.06, label,
-                        ha='center', va='center',
-                        fontsize=9, fontweight='bold', zorder=5)
                 if cpt_str:
-                    ax.text(x, y - RY - 0.18, cpt_str,
-                            ha='center', va='top',
-                            fontsize=7, color='#555555', zorder=5)
-            else:
-                ax.text(x, y, label,
-                        ha='center', va='center',
-                        fontsize=9, fontweight='bold', zorder=5)
+                    lbl = f"{lbl}\n{cpt_str}"
+            g.node(n, label=lbl, fillcolor=C_DISC)
 
-        # auto margins
-        all_x = [p[0] for p in pos.values()]
-        all_y = [p[1] for p in pos.values()]
-        margin = 1.5
-        ax.set_xlim(min(all_x) - margin, max(all_x) + margin)
-        ax.set_ylim(min(all_y) - margin, max(all_y) + margin)
+        for s, d in arcs:
+            g.edge(s, d)
 
-        fig.tight_layout()
-        plt.show()
+        try:
+            from IPython.display import display
+            display(g)
+        except Exception:
+            g.view(cleanup=True)
 
     # internal methods: base nodes
     def _full_name(self, name: str) -> str:

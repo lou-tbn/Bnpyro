@@ -218,6 +218,7 @@ class _NodeSpec:
     is_plate_derived: bool = False
     plate_base_name: str = None
     n_bins_override: Optional[int] = None  # per-node bin count (overrides strategy)
+    labels: Optional[list] = None          # custom state labels (Bernoulli/Categorical)
 
 
 # Plate iterator
@@ -308,7 +309,7 @@ class BNppl:
         self._discretization_method = value
 
     # sample
-    def sample(self, name: str, distribution_or_fn: Union[object, Callable], parents: Optional[list[BNNode]] = None, n_bins: Optional[int] = None) -> BNNode:
+    def sample(self, name: str, distribution_or_fn: Union[object, Callable], parents: Optional[list[BNNode]] = None, n_bins: Optional[int] = None, labels: Optional[list] = None) -> BNNode:
         """
         Declares a random variable node (DESIGN phase).
         The pyAgrum node is created lazily at compile() time.
@@ -340,6 +341,7 @@ class BNppl:
             parents=list(parents) if parents else [],
             node=stub,
             n_bins_override=n_bins,
+            labels=list(labels) if labels else None,
         ))
         return stub
 
@@ -363,43 +365,101 @@ class BNppl:
         return BNPlate(self, name, distribution_or_fn, parents)
 
     # recurse
-    def recurse(self, name: str, step_fn: Callable, n_steps: int) -> list:
+    def recurse(self, name_or_fn, step_fn_or_n, n_steps: int = None, *, order: int = 1, labels: Optional[list] = None):
         """
         Encodes a recursive probabilistic program as a chain BN.
         Corresponds to (fix f) applied n_steps times.
 
-        step_fn(i: int, prev: Optional[BNNode]) -> distribution | _BernoulliCPT | Callable
-            i=0, prev=None  : base case  - returns an unconditional distribution
-            i>0, prev=BNNode: step case  - returns a distribution or CPT depending on prev
-                              if a Callable is returned, it is called with parents=[prev]
+        Two modes:
 
-        Returns a list of BNNodes [node_0, ..., node_{n_steps-1}].
+        Single-node (backward-compatible):
+            bn.recurse(name, step_fn, n_steps)
+            step_fn(i, prev: Optional[BNNode]) -> dist | _BernoulliCPT | Callable
+            Returns list[BNNode].
 
-        Example - Bernoulli Markov chain:
-            states = bn.recurse("X",
-                lambda _, prev: dist.Bernoulli(0.5) if prev is None
-                                else bn.where(prev, 0.9, 0.1),
-                n_steps=4
-            )
+            Example - Bernoulli Markov chain:
+                states = bn.recurse("X",
+                    lambda _, prev: Bernoulli(0.5) if prev is None
+                                    else bn.where(prev, 0.9, 0.1),
+                    n_steps=4
+                )
 
-        Example - Gaussian random walk:
-            pos = bn.recurse("pos",
-                lambda _, prev: dist.Normal(0.0, 1.0) if prev is None
-                                else (lambda p: dist.Normal(p, 0.1)),
-                n_steps=5
-            )
+        Multi-node:
+            bn.recurse(step_fn, n_steps, order=1)
+            step_fn(t, prev) where prev = list of min(t, order) dicts,
+                             prev[0] = most recent step {"name": BNNode, ...}
+            Returns dict[str, list[BNNode]]: {"name": [node_0, ..., node_{n-1}], ...}
+
+            Each element returned by step_fn: (local_name, dist_or_fn) or
+                                              (local_name, dist_or_fn, parents)
+            parents can mix BNNode (inter-step) and str (intra-step local name,
+            must appear earlier in the same list).
+
+            Example - position + velocity with intra-step arc:
+                def step_fn(t, prev):
+                    if not prev:
+                        return [
+                            ("vel", Bernoulli(0.5)),
+                            ("loc", Normal(0.0, 1.0)),
+                        ]
+                    p = prev[0]
+                    return [
+                        ("vel", bn.where(p["vel"], 0.8, 0.3)),
+                        ("loc", lambda l, v: Normal(l + v * 0.5, 0.1),
+                                [p["loc"], p["vel"]]),
+                    ]
+                states = bn.recurse(step_fn, n_steps=4)
+                # states["loc"] = [loc_0, loc_1, loc_2, loc_3]
+                # states["vel"] = [vel_0, vel_1, vel_2, vel_3]
         """
+        if isinstance(name_or_fn, str):
+            return self._recurse_single(name_or_fn, step_fn_or_n, n_steps, labels)
+        return self._recurse_multi(name_or_fn, step_fn_or_n, order, labels)
+
+    def _recurse_single(self, name: str, step_fn: Callable, n_steps: int,
+                        labels: Optional[list] = None) -> list:
         nodes: list[BNNode] = []
         for i in range(n_steps):
             prev = nodes[-1] if nodes else None
-            node_name = f"{name}_{i}"
             d_or_fn = step_fn(i, prev)
             if callable(d_or_fn) and not isinstance(d_or_fn, _BernoulliCPT) and prev is not None:
-                node = self.sample(node_name, d_or_fn, parents=[prev])
+                node = self.sample(f"{name}_{i}", d_or_fn, parents=[prev], labels=labels)
             else:
-                node = self.sample(node_name, d_or_fn)
+                node = self.sample(f"{name}_{i}", d_or_fn, labels=labels)
             nodes.append(node)
         return nodes
+
+    def _recurse_multi(self, step_fn: Callable, n_steps: int, order: int,
+                       labels: Optional[dict] = None) -> dict:
+        history: list[dict] = []  # history[0] = most recent step {local_name: BNNode}
+        result: dict[str, list] = {}
+
+        for t in range(n_steps):
+            prev = history[:order]
+            step_specs = step_fn(t, prev)
+            step_nodes: dict[str, BNNode] = {}
+
+            for spec in step_specs:
+                if len(spec) == 2:
+                    local_name, dist_or_fn = spec
+                    parents = []
+                else:
+                    local_name, dist_or_fn, parents = spec
+
+                resolved = []
+                for p in parents:
+                    resolved.append(step_nodes[p] if isinstance(p, str) else p)
+
+                node_labels = labels.get(local_name) if labels else None
+                node = self.sample(f"{local_name}_{t}", dist_or_fn,
+                                   parents=resolved if resolved else None,
+                                   labels=node_labels)
+                step_nodes[local_name] = node
+                result.setdefault(local_name, []).append(node)
+
+            history.insert(0, step_nodes)
+
+        return result
 
     # where
     def where(self, condition: BNNode, p_true, p_false) -> _BernoulliCPT:
@@ -561,14 +621,15 @@ class BNppl:
             saved_n_bins = self._n_bins
             self._n_bins = self._resolve_n_bins(spec)
 
+            lbls = spec.labels
             if callable(d) and parents:
-                compiled = self._add_from_fn(name, d, parents)
+                compiled = self._add_from_fn(name, d, parents, lbls)
             elif isinstance(d, _BernoulliCPT):
-                compiled = self._add_bernoulli_cpt(name, d.cond)
+                compiled = self._add_bernoulli_cpt(name, d.cond, lbls)
             elif isinstance(d, Bernoulli):
-                compiled = self._add_bernoulli_root(name, d.probs)
+                compiled = self._add_bernoulli_root(name, d.probs, lbls)
             elif isinstance(d, Categorical):
-                compiled = self._add_categorical_root(name, d.probs)
+                compiled = self._add_categorical_root(name, d.probs, lbls)
             else:
                 compiled = self._add_continuous(name, d)
 
@@ -809,9 +870,14 @@ class BNppl:
             ys_  = sy + vy / L * off_s
             xd_  = dx - vx / L * off_d
             yd_  = dy - vy / L * off_d
+            # curve skip arcs (level diff > 1) so they don't pass through intermediate nodes
+            skip = abs(level.get(d, 0) - level.get(s, 0)) > 1
+            rad  = 0.35 if skip else 0.0
+            conn = f"arc3,rad={rad}" if rad else "arc3,rad=0"
             ax.annotate("", xy=(xd_, yd_), xytext=(xs_, ys_),
                         arrowprops=dict(arrowstyle="-|>", color="#2C3E50",
-                                        lw=1.5, mutation_scale=16),
+                                        lw=1.5, mutation_scale=16,
+                                        connectionstyle=conn),
                         zorder=2)
 
         # nodes
@@ -851,24 +917,27 @@ class BNppl:
     def _full_name(self, name: str) -> str:
         return name
 
-    def _add_bernoulli_root(self, name: str, p: float) -> BNNode:
+    def _add_bernoulli_root(self, name: str, p: float, labels=None) -> BNNode:
         var = gum.LabelizedVariable(name, name, 2)
-        var.changeLabel(0, "False")
-        var.changeLabel(1, "True")
+        var.changeLabel(0, labels[0] if labels else "False")
+        var.changeLabel(1, labels[1] if labels else "True")
         self._gum_bn.add(var)
         self._gum_bn.cpt(name).fillWith([1 - p, p])
         return self._register(name, False)
 
-    def _add_categorical_root(self, name: str, probs: list) -> BNNode:
+    def _add_categorical_root(self, name: str, probs: list, labels=None) -> BNNode:
         var = gum.LabelizedVariable(name, name, len(probs))
+        if labels:
+            for i, lbl in enumerate(labels):
+                var.changeLabel(i, lbl)
         self._gum_bn.add(var)
         self._gum_bn.cpt(name).fillWith(probs)
         return self._register(name, False)
 
-    def _add_bernoulli_cpt(self, name: str, cond: _Conditional) -> BNNode:
+    def _add_bernoulli_cpt(self, name: str, cond: _Conditional, labels=None) -> BNNode:
         var = gum.LabelizedVariable(name, name, 2)
-        var.changeLabel(0, "False")
-        var.changeLabel(1, "True")
+        var.changeLabel(0, labels[0] if labels else "False")
+        var.changeLabel(1, labels[1] if labels else "True")
         self._gum_bn.add(var)
 
         all_parents = _collect_parents(cond)
@@ -911,7 +980,7 @@ class BNppl:
         return float(idx)
 
     def _add_from_fn(self, name: str, dist_fn: Callable,
-                     parents: list[BNNode]) -> BNNode:
+                     parents: list[BNNode], labels=None) -> BNNode:
         """
         Probes dist_fn to detect the returned distribution type,
         then routes to the appropriate construction method.
@@ -927,17 +996,17 @@ class BNppl:
         probe_dist = dist_fn(*probe_vals)
 
         if isinstance(probe_dist, Bernoulli):
-            return self._add_bernoulli_from_fn(name, dist_fn, parents)
+            return self._add_bernoulli_from_fn(name, dist_fn, parents, labels)
         if isinstance(probe_dist, Categorical):
-            return self._add_categorical_from_fn(name, dist_fn, parents)
+            return self._add_categorical_from_fn(name, dist_fn, parents, labels)
         return self._add_continuous_conditional(name, dist_fn, parents)
 
     def _add_bernoulli_from_fn(self, name: str, dist_fn: Callable,
-                                parents: list[BNNode]) -> BNNode:
+                                parents: list[BNNode], labels=None) -> BNNode:
         """Bernoulli node whose probability is a function of parents (any types)."""
         var = gum.LabelizedVariable(name, name, 2)
-        var.changeLabel(0, "False")
-        var.changeLabel(1, "True")
+        var.changeLabel(0, labels[0] if labels else "False")
+        var.changeLabel(1, labels[1] if labels else "True")
         self._gum_bn.add(var)
         for p in parents:
             self._gum_bn.addArc(p.name, name)
@@ -956,7 +1025,7 @@ class BNppl:
         return self._register(name, False)
 
     def _add_categorical_from_fn(self, name: str, dist_fn: Callable,
-                                  parents: list[BNNode]) -> BNNode:
+                                  parents: list[BNNode], labels=None) -> BNNode:
         """Categorical node (k values) whose probabilities are a function of parents."""
         probe_vals = [
             float((p.ticks[0] + p.ticks[-1]) / 2) if p.is_continuous else 0.0
@@ -965,6 +1034,9 @@ class BNppl:
         k = len(dist_fn(*probe_vals).probs)
 
         var = gum.LabelizedVariable(name, name, k)
+        if labels:
+            for i, lbl in enumerate(labels):
+                var.changeLabel(i, lbl)
         self._gum_bn.add(var)
         for p in parents:
             self._gum_bn.addArc(p.name, name)

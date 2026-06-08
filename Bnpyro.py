@@ -8,7 +8,7 @@ It's base on the article "Higher Order Bayesian Networks, Exactly" by
 Claudia FAGGIAN, Daniele PAUTASSO and Gabriele VANONI.
 
 Usage:
-    bn   = BNContext()
+    bn   = BNppl()
     rain = bn.sample("rain", dist.Bernoulli(0.2))
     wet  = bn.sample("wet",  bn.where(rain, 0.7, 0.01))
     coin = bn.plate("coin", bn.where(rain, 0.8, 0.3))  # "!" from λ!-calculus
@@ -24,19 +24,20 @@ Correspondence with λ!-calculus (Faggian, Pautasso, Vanoni - POPL 2024):
     f()                                    <->  der f
 
 Dependencies:
-    pip install pyagrum pyro-ppl torch
-    pip install scipy   # required only for discretization_method=INTEGRATION
+    pip install pyagrum scipy matplotlib
 """
 
 from __future__ import annotations
 
-import torch
-import pyro.distributions as dist
 import pyagrum as gum
 import numpy as np
 from dataclasses import dataclass, field
 from itertools import product as iproduct
 from typing import Optional, Callable, Union
+from distributions import (
+    Bernoulli, Categorical, Normal, Beta, Gamma,
+    Uniform, Exponential, LogNormal,
+)
 
 
 # CONSTANTS: discretization methods
@@ -44,7 +45,7 @@ from typing import Optional, Callable, Union
 MIDPOINT    = "midpoint"
 INTEGRATION = "integration"
 
-# CONSTANTS: BNContext states
+# CONSTANTS: BNppl states
 
 DESIGN   = "design"
 COMPILED = "compiled"
@@ -59,29 +60,26 @@ BIN_ADAPTIVE = "adaptive"   # fewer bins for nodes with many continuous parents
 
 def _get_dist_range(distribution) -> tuple[float, float]:
     """Returns (lo, hi) covering ~99% of the probability mass of a continuous distribution."""
-    def _f(x):
-        return float(x.item() if hasattr(x, "item") else x)
-
-    if isinstance(distribution, dist.Normal):
-        mu, sigma = _f(distribution.loc), _f(distribution.scale)
+    if isinstance(distribution, Normal):
+        mu, sigma = distribution.loc, distribution.scale
         return mu - 3 * sigma, mu + 3 * sigma
 
-    if isinstance(distribution, dist.Beta):
-        a, b = _f(distribution.concentration1), _f(distribution.concentration0)
+    if isinstance(distribution, Beta):
+        a, b = distribution.concentration1, distribution.concentration0
         mu = a / (a + b)
         sigma = np.sqrt(a * b / ((a + b) ** 2 * (a + b + 1)))
         return max(0.001, mu - 3 * sigma), min(0.999, mu + 3 * sigma)
 
-    if isinstance(distribution, dist.Gamma):
-        a, r  = _f(distribution.concentration), _f(distribution.rate)
+    if isinstance(distribution, Gamma):
+        a, r = distribution.concentration, distribution.rate
         mu = a / r
         sigma = np.sqrt(a) / r
         return max(0.001, mu - 3 * sigma), mu + 3 * sigma
 
-    if isinstance(distribution, dist.Uniform):
-        return _f(distribution.low), _f(distribution.high)
+    if isinstance(distribution, Uniform):
+        return distribution.low, distribution.high
 
-    samples = distribution.sample((10_000,)).numpy()
+    samples = distribution.sample(10_000)
     return float(np.percentile(samples, 1)), float(np.percentile(samples, 99))
 
 def _dist_to_cpt(distribution, ticks: np.ndarray) -> list[float]:
@@ -90,11 +88,10 @@ def _dist_to_cpt(distribution, ticks: np.ndarray) -> list[float]:
     try:
         for i in range(len(ticks) - 1):
             lo, hi = float(ticks[i]), float(ticks[i + 1])
-            p = float(distribution.cdf(torch.tensor(hi, dtype=torch.float32)).item()) \
-              - float(distribution.cdf(torch.tensor(lo, dtype=torch.float32)).item())
+            p = distribution.cdf(hi) - distribution.cdf(lo)
             probs.append(max(0.0, p))
     except (NotImplementedError, AttributeError):
-        samples = distribution.sample((10_000,)).numpy()
+        samples = distribution.sample(10_000)
         counts, _ = np.histogram(samples, bins=ticks)
         probs = counts.tolist()
     total = sum(probs)
@@ -112,7 +109,7 @@ def _discretize_continuous(name: str, distribution, n_bins: int = 10):
 # Nodes
 
 class BNNode:
-    """A random variable node in a BNContext."""
+    """A random variable node in a BNppl."""
 
     def __init__(self, name: str, is_continuous: bool = False, ticks: Optional[np.ndarray] = None):
         self.name = name
@@ -142,7 +139,7 @@ class BNPlate:
       Parametric - bn.plate("coin", lambda b: dist.Bernoulli(b), parents=[bias_node])
     """
 
-    def __init__(self, ctx: "BNContext", base_name: str,
+    def __init__(self, ctx: "BNppl", base_name: str,
                  dist_or_fn, fn_parents: Optional[list] = None):
         self._ctx = ctx
         self._base_name = base_name
@@ -227,7 +224,7 @@ class _NodeSpec:
 
 # MAIN CONTEXT
 
-class BNContext:
+class BNppl:
     """
     Context for compiling a probabilistic program into a pyAgrum Bayesian Network.
 
@@ -245,7 +242,7 @@ class BNContext:
         bn.discretization_method = INTEGRATION
 
     Examples:
-        bn   = BNContext()
+        bn   = BNppl()
         rain = bn.sample("rain", dist.Bernoulli(0.2))
         wet  = bn.sample("wet",  bn.where(rain, 0.9, 0.01))
 
@@ -568,11 +565,10 @@ class BNContext:
                 compiled = self._add_from_fn(name, d, parents)
             elif isinstance(d, _BernoulliCPT):
                 compiled = self._add_bernoulli_cpt(name, d.cond)
-            elif isinstance(d, dist.Bernoulli):
-                p = float(d.probs.item() if hasattr(d.probs, "item") else d.probs)
-                compiled = self._add_bernoulli_root(name, p)
-            elif isinstance(d, dist.Categorical):
-                compiled = self._add_categorical_root(name, d.probs.tolist())
+            elif isinstance(d, Bernoulli):
+                compiled = self._add_bernoulli_root(name, d.probs)
+            elif isinstance(d, Categorical):
+                compiled = self._add_categorical_root(name, d.probs)
             else:
                 compiled = self._add_continuous(name, d)
 
@@ -920,9 +916,9 @@ class BNContext:
         Probes dist_fn to detect the returned distribution type,
         then routes to the appropriate construction method.
 
-            lambda p: dist.Bernoulli(p)        -> _add_bernoulli_from_fn
-            lambda p: dist.Categorical(probs)  -> _add_categorical_from_fn
-            lambda p: dist.Normal(p, 1.0)      -> _add_continuous_conditional
+            lambda p: Bernoulli(p)             -> _add_bernoulli_from_fn
+            lambda p: Categorical(probs)       -> _add_categorical_from_fn
+            lambda p: Normal(p, 1.0)           -> _add_continuous_conditional
         """
         probe_vals = [
             float((p.ticks[0] + p.ticks[-1]) / 2) if p.is_continuous else 0.0
@@ -930,9 +926,9 @@ class BNContext:
         ]
         probe_dist = dist_fn(*probe_vals)
 
-        if isinstance(probe_dist, dist.Bernoulli):
+        if isinstance(probe_dist, Bernoulli):
             return self._add_bernoulli_from_fn(name, dist_fn, parents)
-        if isinstance(probe_dist, dist.Categorical):
+        if isinstance(probe_dist, Categorical):
             return self._add_categorical_from_fn(name, dist_fn, parents)
         return self._add_continuous_conditional(name, dist_fn, parents)
 
@@ -952,7 +948,7 @@ class BNContext:
         while not inst.end():
             parent_vals = [self._repr_val(inst, p) for p in parents]
             d   = dist_fn(*parent_vals)
-            p_t = float(d.probs.item() if hasattr(d.probs, "item") else d.probs)
+            p_t = float(d.probs)
             x_val = inst.val(self._gum_bn.variable(name))
             pot.set(inst, p_t if x_val == 1 else 1.0 - p_t)
             inst.inc()
@@ -1109,8 +1105,8 @@ class BNContext:
                     else:
                         args.append(disc_vals[i])
                 d = dist_fn(*args)
-                cdf_hi = float(d.cdf(torch.tensor(x_hi, dtype=torch.float32)).item())
-                cdf_lo = float(d.cdf(torch.tensor(x_lo, dtype=torch.float32)).item())
+                cdf_hi = d.cdf(x_hi)
+                cdf_lo = d.cdf(x_lo)
                 return max(0.0, cdf_hi - cdf_lo)
             return integrand
 

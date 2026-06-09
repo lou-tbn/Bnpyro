@@ -132,10 +132,6 @@ gnb.showBN(bn.gum_bn)   # pyAgrum's own visualizer (in notebooks)
 src/
   Bnpyro.py              # Main library
   Bnpyro_Tutorial.ipynb  # Tutorial notebook (10 examples)
-LaTeX/
-  Bnpyro.tex             # Detailed documentation (French)
-  main.tex               # Master LaTeX document
-  Bibliographie.bib      # Bibliography
 ```
 
 

@@ -669,7 +669,7 @@ class BNppl:
         # Summary line 
         print(f"\nBN compiled : {n_nodes} nodes, "
               f"{len(self._gum_bn.arcs())} arcs, "
-              f"{total_entries:,} CPT entries ({mem_mb:.1f} MB)"
+              f"{total_entries:,} CPT entries ({mem_mb:.3f} MB)"
               f"  [n_bins={self._n_bins}, strategy={self._bin_strategy},"
               f" method={self._discretization_method}]")
 
@@ -680,7 +680,7 @@ class BNppl:
                 f"{n} ({e:,} entries)" for e, n in top
             )
             raise RuntimeError(
-                f"Compilation aborted: BN requires {mem_mb:.1f} MB "
+                f"Compilation aborted: BN requires {mem_mb:.3f} MB "
                 f"which exceeds memory_limit_mb={self._memory_limit_mb} MB.\n"
                 f"Largest nodes: {top_str}\n"
                 f"Suggestions:\n"
@@ -692,8 +692,8 @@ class BNppl:
         # Soft warning 
         if mem_mb > self._memory_warn_mb:
             top = sorted(node_entries, reverse=True)[:3]
-            print(f"[WARN] Large BN ({mem_mb:.0f} MB > warn threshold "
-                  f"{self._memory_warn_mb:.0f} MB).")
+            print(f"[WARN] Large BN ({mem_mb:.3f} MB > warn threshold "
+                  f"{self._memory_warn_mb:.3f} MB).")
             print(f"Top-3 nodes by CPT size:")
             for entries, name in top:
                 n_parents = len(list(self._gum_bn.parents(

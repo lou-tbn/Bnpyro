@@ -19,6 +19,7 @@ import numpy as np
 from scipy.stats import (
     norm as _norm, beta as _beta, gamma as _gamma,
     uniform as _uniform, expon as _expon, lognorm as _lognorm,
+    poisson as _poisson, binom as _binom,
 )
 
 
@@ -102,6 +103,31 @@ class Exponential:
 
     def sample(self, n: int) -> np.ndarray:
         return _expon.rvs(scale=1.0 / self.rate, size=n)
+
+
+class Poisson:
+    """Poisson(rate): discrete distribution over {0, 1, 2, ...}."""
+    def __init__(self, rate):
+        self.rate = float(rate)
+
+    def pmf(self, k: int) -> float:
+        return float(_poisson.pmf(k, self.rate))
+
+    def sample(self, n: int) -> np.ndarray:
+        return _poisson.rvs(self.rate, size=n)
+
+
+class Binomial:
+    """Binomial(total_count, probs): discrete distribution over {0, 1, ..., total_count}."""
+    def __init__(self, total_count, probs):
+        self.total_count = int(total_count)
+        self.probs = float(probs)
+
+    def pmf(self, k: int) -> float:
+        return float(_binom.pmf(k, self.total_count, self.probs))
+
+    def sample(self, n: int) -> np.ndarray:
+        return _binom.rvs(self.total_count, self.probs, size=n)
 
 
 class LogNormal:

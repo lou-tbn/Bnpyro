@@ -36,7 +36,7 @@ from itertools import product as iproduct
 from typing import Optional, Callable, Union
 from distributions import (
     Bernoulli, Categorical, Normal, Beta, Gamma,
-    Uniform, Exponential, LogNormal,
+    Uniform, Exponential, LogNormal, Poisson, Binomial,
 )
 
 
@@ -81,6 +81,25 @@ def _get_dist_range(distribution) -> tuple[float, float]:
 
     samples = distribution.sample(10_000)
     return float(np.percentile(samples, 1)), float(np.percentile(samples, 99))
+
+def _get_discrete_domain(distribution) -> tuple[int, int]:
+    """Returns (min_k, max_k) for a discrete count distribution (Poisson / Binomial)."""
+    if isinstance(distribution, Binomial):
+        return 0, distribution.total_count
+    if isinstance(distribution, Poisson):
+        max_k = int(_poisson_ppf(0.9999, distribution.rate)) + 1
+        return 0, max(max_k, 1)
+    raise TypeError(f"Not a discrete count distribution: {type(distribution)}")
+
+def _poisson_ppf(q: float, rate: float) -> int:
+    from scipy.stats import poisson as _sp_poisson
+    return int(_sp_poisson.ppf(q, rate))
+
+def _dist_to_range_cpt(distribution, min_k: int, max_k: int) -> list[float]:
+    """Computes normalized PMF for a discrete distribution over [min_k, max_k]."""
+    probs = [max(0.0, distribution.pmf(k)) for k in range(min_k, max_k + 1)]
+    total = sum(probs)
+    return [p / total for p in probs] if total > 0 else [1.0 / len(probs)] * len(probs)
 
 def _dist_to_cpt(distribution, ticks: np.ndarray) -> list[float]:
     """Computes P(X in bin_i) for each bin via CDF (or Monte Carlo fallback), normalized."""
@@ -632,6 +651,8 @@ class BNppl:
                 compiled = self._add_bernoulli_root(name, d.probs, lbls)
             elif isinstance(d, Categorical):
                 compiled = self._add_categorical_root(name, d.probs, lbls)
+            elif isinstance(d, (Poisson, Binomial)):
+                compiled = self._add_range_root(name, d)
             else:
                 compiled = self._add_continuous(name, d)
 
@@ -912,6 +933,8 @@ class BNppl:
             return self._add_bernoulli_from_fn(name, dist_fn, parents, labels)
         if isinstance(probe_dist, Categorical):
             return self._add_categorical_from_fn(name, dist_fn, parents, labels)
+        if isinstance(probe_dist, (Poisson, Binomial)):
+            return self._add_range_from_fn(name, dist_fn, parents)
         return self._add_continuous_conditional(name, dist_fn, parents)
 
     def _add_bernoulli_from_fn(self, name: str, dist_fn: Callable,
@@ -962,6 +985,59 @@ class BNppl:
             probs   = dist_fn(*parent_vals).probs.tolist()
             cat_val = inst.val(self._gum_bn.variable(name))
             pot.set(inst, probs[cat_val])
+            inst.inc()
+
+        return self._register(name, False)
+
+    def _add_range_root(self, name: str, distribution) -> BNNode:
+        """Root node for a discrete count distribution (Poisson / Binomial) using RangeVariable."""
+        min_k, max_k = _get_discrete_domain(distribution)
+        var = gum.RangeVariable(name, name, min_k, max_k)
+        self._gum_bn.add(var)
+        self._gum_bn.cpt(name).fillWith(_dist_to_range_cpt(distribution, min_k, max_k))
+        return self._register(name, False)
+
+    def _add_range_from_fn(self, name: str, dist_fn: Callable,
+                           parents: list[BNNode]) -> BNNode:
+        """Discrete count node (Poisson / Binomial) whose parameter depends on parents."""
+        # Probe at parent extremes to determine the widest output domain needed
+        probe_points: list[list[float]] = []
+        for p in parents:
+            if p.is_continuous:
+                t = p.ticks
+                probe_points.append([float(t[0]), float((t[0] + t[-1]) / 2), float(t[-1])])
+            else:
+                probe_points.append([float(i) for i in range(
+                    self._gum_bn.variable(p.name).domainSize())])
+
+        min_k, max_k = 0, 0
+        for combo in iproduct(*probe_points):
+            _, mk = _get_discrete_domain(dist_fn(*combo))
+            max_k = max(max_k, mk)
+
+        var = gum.RangeVariable(name, name, min_k, max_k)
+        self._gum_bn.add(var)
+        for p in parents:
+            self._gum_bn.addArc(p.name, name)
+
+        # Precompute PMF for every parent combination (avoids recomputing per child state)
+        parent_domain = [range(self._gum_bn.variable(p.name).domainSize()) for p in parents]
+        pmf_cache: dict[tuple, list[float]] = {}
+        for combo in iproduct(*parent_domain):
+            parent_vals = [
+                float((p.ticks[idx] + p.ticks[idx + 1]) / 2) if p.is_continuous
+                else float(idx)
+                for p, idx in zip(parents, combo)
+            ]
+            pmf_cache[combo] = _dist_to_range_cpt(dist_fn(*parent_vals), min_k, max_k)
+
+        pot  = self._gum_bn.cpt(name)
+        inst = gum.Instantiation(pot)
+        inst.setFirst()
+        while not inst.end():
+            parent_combo = tuple(inst.val(self._gum_bn.variable(p.name)) for p in parents)
+            k_idx = inst.val(self._gum_bn.variable(name))
+            pot.set(inst, pmf_cache[parent_combo][k_idx])
             inst.inc()
 
         return self._register(name, False)

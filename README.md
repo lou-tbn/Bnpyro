@@ -11,35 +11,38 @@ Instead of approximate Monte Carlo inference (as in Pyro/Stan), Bnpyro compiles 
 
 ## How it works
 
-```mermaid
-flowchart LR
-    A["🐍 Probabilistic\nProgram\n(Python)"]
-    B["🔗 Bayesian\nNetwork\n(pyAgrum)"]
-    C["📊 Exact\nPosterior\nP(X | evidence)"]
-    A -->|"bn.compile()"| B
-    B -->|"bn.query()"| C
+```python
+from Bnpyro import BNppl
+from distributions import Bernoulli
+
+bn   = BNppl()
+rain = bn.sample("rain", Bernoulli(0.2))
+wet  = bn.sample("wet",  bn.where(rain, p_true=0.9, p_false=0.01))
+bn.compile()
+# BN compiled: 2 nodes, 1 arc, 6 CPT entries (0.000 MB)
+
+bn.query("rain", evidence={"wet": True})
+# {'False': 0.054, 'True': 0.946}
 ```
 
-Each `bn.sample(...)` call becomes a BN node; each distribution becomes a CPT; `bn.compile()` wires everything together.
+Each `bn.sample(...)` call becomes a BN node; each distribution becomes a CPT. `bn.compile()` wires everything together and `bn.query()` runs exact inference.
 
-### Example: Rain -> Wet
+---
+
+## Example: Rain → Wet
 
 ```python
 bn   = BNppl()
 rain = bn.sample("rain", Bernoulli(0.2))
 wet  = bn.sample("wet",  bn.where(rain, 0.9, 0.01))
 bn.compile()
-
-p = bn.query("rain", evidence={"wet": True})
+bn.query("rain", evidence={"wet": True})
 # {'False': 0.054, 'True': 0.946}
 ```
 
-```mermaid
-graph LR
-    R["rain\nBernoulli(0.2)"] -->|"bn.where"| W["wet\nBernoulli(CPT)"]
-    style R fill:#AED6F1,stroke:#2874A6
-    style W fill:#A9DFBF,stroke:#1E8449
-```
+Posterior P(rain | wet=True) — exact inference, no sampling:
+
+![Rain-Wet inference](img/rain_wet_inference.svg)
 
 ---
 
@@ -69,28 +72,40 @@ Clone or copy `Bnpyro.py` and `distributions.py` into your project.
 
 ## Quick Start
 
+### Continuous variables
+
 ```python
 from Bnpyro import BNppl
 from distributions import Normal, Uniform
 
-bn    = BNppl(n_bins=15)
-mu    = bn.sample("mu",    Normal(0.0, 1.0))
+bn    = BNppl(n_bins=8)
+mu    = bn.sample("mu",    Normal(0.0, 2.0))
 sigma = bn.sample("sigma", Uniform(0.5, 2.0))
 x     = bn.sample("x", lambda m, s: Normal(m, s), parents=[mu, sigma])
 bn.compile()
-# BN compiled: 3 nodes, 2 arcs, 3375 CPT entries (0.027 MB)
-
-p = bn.query("mu", evidence={"x": 5})   # P(μ | X in bin containing 5)
+# BN compiled: 3 nodes, 2 arcs, 528 CPT entries (0.004 MB)
 ```
 
-```mermaid
-graph LR
-    M["μ ~ Normal(0,1)"] --> X["x ~ Normal(μ,σ)"]
-    S["σ ~ Uniform(0.5,2)"] --> X
-    style M fill:#AED6F1,stroke:#2874A6
-    style S fill:#AED6F1,stroke:#2874A6
-    style X fill:#FAD7A0,stroke:#CA6F1E
+BN structure — `mu` and `sigma` drive the conditional distribution of `x`:
+
+![Continuous BN structure](img/continuous_bn.svg)
+
+### Count variables (Poisson / Binomial)
+
+```python
+from distributions import Poisson, Uniform
+
+bn   = BNppl()
+rate = bn.sample("rate", Uniform(1.0, 5.0))
+k    = bn.sample("k", lambda r: Poisson(r), parents=[rate])
+bn.compile()
+bn.query("rate", evidence={"k": 6})
+# posterior of rate shifts toward higher values
 ```
+
+Posterior P(rate | k=6) — observing a high count updates the rate belief upward:
+
+![Poisson conditional inference](img/poisson_inference.svg)
 
 ---
 
@@ -99,17 +114,17 @@ graph LR
 | Notebook | Content |
 |---|---|
 | [`Bnpyro_Tutorial.ipynb`](Bnpyro_Tutorial.ipynb) | 8 worked examples (discrete, continuous, plates, recursion, HOF) |
-| [`Discretization.ipynb`](Discretization.ipynb) | Deep dive into discretization: n_bins, MIDPOINT vs INTEGRATION, CPT explosion, BIN_ADAPTIVE, memory limits |
+| [`Discretization.ipynb`](Discretization.ipynb) | Deep dive: n_bins, MIDPOINT vs INTEGRATION, CPT explosion, BIN_ADAPTIVE, memory limits |
 | [`Pyro_vs_Bnpyro.ipynb`](Pyro_vs_Bnpyro.ipynb) | Side-by-side comparison with Pyro: discrete BN, plates/thunks, continuous MCMC vs exact BN |
 | [`recurse_examples.ipynb`](recurse_examples.ipynb) | Examples using `bn.recurse` for dynamic Bayesian networks |
 
 ### Tutorial examples (`Bnpyro_Tutorial.ipynb`)
 
-1. **Classic BN** — Rain -> Wet, exact posterior
+1. **Classic BN** — Rain → Wet, exact posterior
 2. **Thunk (`!t` / `der`)** — Shared biased coin, belief update
 3. **Discretization strategies** — `BIN_UNIFORM` vs `BIN_ADAPTIVE`, CPT size comparison
 4. **Template BN (plate)** — N students sharing the same structure
-5. **Universal lambda** — Continuous -> Bernoulli, Continuous -> Continuous, Categorical -> Continuous
+5. **Universal lambda** — Continuous → Bernoulli, Continuous → Continuous, Categorical → Continuous
 6. **Multi-parent discrete** — WetGrass CPT with nested `bn.where`
 7. **Recursion (`fix`)** — Bernoulli Markov chain + Gaussian random walk
 8. **Higher-order functions** — Parametric thunk, `apply_n`, reusable sensor constructor
@@ -144,7 +159,18 @@ BNppl(
 
 ### Supported distributions (`distributions.py`)
 
-`Bernoulli`, `Categorical`, `Normal`, `Beta`, `Gamma`, `Uniform`, `Exponential`, `LogNormal`
+| Distribution | Variable type | Description |
+|---|---|---|
+| `Bernoulli(p)` | LabelizedVariable | P(X=True) = p |
+| `Categorical(probs)` | LabelizedVariable | Discrete over {0, 1, ..., K-1} |
+| `Normal(loc, scale)` | DiscretizedVariable | Discretized Gaussian |
+| `Beta(a, b)` | DiscretizedVariable | Discretized Beta |
+| `Gamma(concentration, rate)` | DiscretizedVariable | Discretized Gamma |
+| `Uniform(low, high)` | DiscretizedVariable | Discretized Uniform |
+| `Exponential(rate)` | DiscretizedVariable | Discretized Exponential |
+| `LogNormal(loc, scale)` | DiscretizedVariable | Discretized LogNormal |
+| `Poisson(rate)` | **RangeVariable** | Integer-valued {0, 1, ..., ppf(0.9999, rate)} |
+| `Binomial(n, p)` | **RangeVariable** | Integer-valued {0, 1, ..., n} |
 
 ---
 
@@ -157,7 +183,7 @@ Continuous variables are approximated by a discrete histogram over `n_bins` equa
 | Strategy | Behaviour | When to use |
 |---|---|---|
 | `BIN_UNIFORM` | All nodes get `n_bins` | Default — full precision everywhere |
-| `BIN_ADAPTIVE` | Fewer bins for nodes with many parents (k=2 -> `n_bins//2`, k≥3 -> `max(3, n_bins//4)`) | Avoid CPT explosion with many parents |
+| `BIN_ADAPTIVE` | Fewer bins for nodes with many parents (k=2 → `n_bins//2`, k≥3 → `max(3, n_bins//4)`) | Avoid CPT explosion with many parents |
 
 ### Discretization methods (for conditional nodes)
 
@@ -176,64 +202,51 @@ where k = number of continuous parents. Use `BIN_ADAPTIVE` or per-node override 
 
 ```python
 bn = BNppl(n_bins=20, memory_warn_mb=10.0, memory_limit_mb=100.0)
+bn.compile()
+# [WARN] Total CPT memory: 12.50 MB > threshold 10.00 MB
+# Top-3 largest nodes:  x (10.00 MB)  mu (1.25 MB)  sigma (1.25 MB)
+# Tips: lower n_bins, use BIN_ADAPTIVE, or set memory_limit_mb
 ```
-
-- `memory_warn_mb`: prints a warning + per-node breakdown if total CPT exceeds threshold
-- `memory_limit_mb`: raises `RuntimeError` and aborts compilation if exceeded
-
-### Recommended `n_bins`
-
-| Continuous parents k | Recommended `n_bins` |
-|---|---|
-| 0 — root node | 15 – 30 |
-| 1 | 10 – 15 |
-| 2 | 8 – 10 |
-| 3+ | use `BIN_ADAPTIVE` |
 
 ---
 
 ## Advanced patterns
 
-### Nested `bn.where` for multi-parent CPT
+### Nested `bn.where` — WetGrass
 
 ```python
-# WetGrass depends on Rain AND Sprinkler
-wetgrass = bn.sample("wetgrass", bn.where(rain,
-    bn.where(sprinkler, 0.99, 0.90),   # rain=T: P(wet | spr=T/F)
-    bn.where(sprinkler, 0.90, 0.01)    # rain=F: P(wet | spr=T/F)
+bn        = BNppl()
+rain      = bn.sample("rain",      Bernoulli(0.5))
+sprinkler = bn.sample("sprinkler", bn.where(rain, 0.1, 0.5))
+wetgrass  = bn.sample("wetgrass",  bn.where(rain,
+    bn.where(sprinkler, 0.99, 0.90),
+    bn.where(sprinkler, 0.90, 0.01),
 ))
+bn.compile()
+bn.query("rain", evidence={"wetgrass": True})
+# {'False': 0.250, 'True': 0.750}   ← P(rain | wet) = 0.75 exactly
 ```
 
-```mermaid
-graph TD
-    R["rain"] --> S["sprinkler"]
-    R --> W["wetgrass"]
-    S --> W
-    style R fill:#AED6F1,stroke:#2874A6
-    style S fill:#AED6F1,stroke:#2874A6
-    style W fill:#A9DFBF,stroke:#1E8449
-```
+P(rain, sprinkler | wetgrass=True) — both causes updated simultaneously:
 
-### Plate (thunk) — N i.i.d. observations
+![WetGrass inference](img/wetgrass_inference.svg)
+
+### Plate (thunk) — N i.i.d. coin flips
 
 ```python
 theta = bn.sample("theta", Beta(2.0, 2.0))
 coin  = bn.plate("flip", lambda t: Bernoulli(t), parents=[theta])
-flips = [coin() for _ in range(8)]   # flip_1 .. flip_8
+flips = [coin() for _ in range(4)]
+bn.compile()
+
+# Observe 3 heads, 1 tail → posterior of theta shifts up
+evidence = {"flip_1": True, "flip_2": True, "flip_3": True, "flip_4": False}
+bn.query("theta", evidence=evidence)
 ```
 
-```mermaid
-graph LR
-    T["θ ~ Beta(2,2)"] --> F1["flip_1"]
-    T --> F2["flip_2"]
-    T --> F3["..."]
-    T --> F8["flip_8"]
-    style T fill:#FAD7A0,stroke:#CA6F1E
-    style F1 fill:#AED6F1,stroke:#2874A6
-    style F2 fill:#AED6F1,stroke:#2874A6
-    style F3 fill:#AED6F1,stroke:#2874A6
-    style F8 fill:#AED6F1,stroke:#2874A6
-```
+P(theta | 3 heads, 1 tail) — one shared parameter, N independent observations:
+
+![Plate inference](img/plate_inference.svg)
 
 ### Temporal model (DBN via `recurse`)
 
@@ -241,19 +254,16 @@ graph LR
 states = bn.recurse("X",
     lambda i, prev: Bernoulli(0.5) if prev is None
                     else bn.where(prev, 0.9, 0.1),
-    n_steps=5
+    n_steps=4
 )
+bn.compile()
+bn.query("X_3", evidence={"X_0": True})
+# {'False': 0.295, 'True': 0.705}   (started True, slowly diffusing toward 0.5)
 ```
 
-```mermaid
-graph LR
-    X0["X_0\nBern(0.5)"] -->|"bn.where"| X1["X_1"]
-    X1 -->|"bn.where"| X2["X_2"]
-    X2 -->|"bn.where"| X3["..."]
-    style X0 fill:#AED6F1,stroke:#2874A6
-    style X1 fill:#AED6F1,stroke:#2874A6
-    style X2 fill:#AED6F1,stroke:#2874A6
-```
+P(X_1, X_2, X_3 | X_0=True) — belief propagates forward through the chain:
+
+![DBN inference](img/dbn_inference.svg)
 
 ### Access all pyAgrum tools
 
@@ -262,6 +272,7 @@ import pyagrum as gum
 import pyagrum.lib.notebook as gnb
 
 gnb.showBN(bn.gum_bn)              # visual graph in notebook
+gnb.showInference(bn.gum_bn, evs={"wet": True}, targets=["rain"])
 ie = gum.VariableElimination(bn.gum_bn)
 ```
 
@@ -271,11 +282,12 @@ ie = gum.VariableElimination(bn.gum_bn)
 
 ```
 Bnpyro.py                  # Main library
-distributions.py           # Lightweight distribution classes (Normal, Beta, ...)
+distributions.py           # Distribution classes (Normal, Beta, Poisson, ...)
 Bnpyro_Tutorial.ipynb      # 8 worked examples
 Discretization.ipynb       # Discretization deep dive
 Pyro_vs_Bnpyro.ipynb       # Comparison with Pyro (discrete, plates, continuous)
 recurse_examples.ipynb     # Recursion / DBN examples
+img/                       # BN graph visualizations (generated by pyAgrum)
 ```
 
 ---

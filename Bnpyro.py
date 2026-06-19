@@ -29,11 +29,15 @@ Dependencies:
 
 from __future__ import annotations
 
+import logging
+import warnings
 import pyagrum as gum
 import numpy as np
 from dataclasses import dataclass, field
 from itertools import product as iproduct
 from typing import Optional, Callable, Union
+
+logger = logging.getLogger(__name__)
 from distributions import (
     Bernoulli, Categorical, Normal, Beta, Gamma,
     Uniform, Exponential, LogNormal, Poisson, Binomial,
@@ -52,8 +56,9 @@ COMPILED = "compiled"
 
 # CONSTANTS: bin strategies
 
-BIN_UNIFORM  = "uniform"    # all nodes get n_bins (default)
-BIN_ADAPTIVE = "adaptive"   # fewer bins for nodes with many continuous parents
+BIN_UNIFORM        = "uniform"         # all nodes get n_bins (default)
+BIN_ADAPTIVE       = "adaptive"        # fewer bins for nodes with many continuous parents
+BIN_MEMORY_BUDGET  = "memory_budget"   # each node targets an equal share of memory_warn_mb
 
 
 # Utilities
@@ -240,94 +245,41 @@ class _NodeSpec:
     labels: Optional[list] = None          # custom state labels (Bernoulli/Categorical)
 
 
-# Plate iterator
-
 # MAIN CONTEXT
 
 class BNppl:
     """
     Context for compiling a probabilistic program into a pyAgrum Bayesian Network.
 
-    Parameters:
-        n_bins                 : number of bins for discretization (default: 10)
-        discretization_method  : MIDPOINT (default) or INTEGRATION
-
-    Discretization method for continuous nodes with continuous parents:
-        MIDPOINT    — evaluates the distribution at each parent bin center.
-                      Fast; accurate for fine bins.
-        INTEGRATION — numerically integrates P(X in bin_i | Y in bin_j) via scipy.
-                      More accurate for coarse bins; requires scipy.
-
-    The method can be changed at any time:
-        bn.discretization_method = INTEGRATION
-
-    Examples:
+    Build phase:
         bn   = BNppl()
-        rain = bn.sample("rain", dist.Bernoulli(0.2))
+        rain = bn.sample("rain", Bernoulli(0.2))
         wet  = bn.sample("wet",  bn.where(rain, 0.9, 0.01))
 
-        # Continuous node without parents
-        temp = bn.sample("temp", dist.Normal(20.0, 5.0))
+    Compile phase (discretization options passed here):
+        bn.compile(n_bins=10, estimate_proba_method=MIDPOINT)
 
-        # Continuous node conditioned by continuous parent
-        mu = bn.sample("mu", dist.Normal(0.0, 1.0))
-        x  = bn.sample("x", lambda mu_val: dist.Normal(mu_val, 1.0), parents=[mu])
-
+    Query phase:
         p = bn.query("rain", evidence={"wet": True})
     """
 
-    def __init__(self, n_bins: int = 10,
-                 discretization_method: str = MIDPOINT,
-                 bin_strategy: str = BIN_UNIFORM,
-                 memory_warn_mb: float = 50.0,
-                 memory_limit_mb: Optional[float] = None,
-                 name: str = "BN"):
-        """
-        Parameters
-        ----------
-        n_bins : default number of bins for continuous nodes
-        discretization_method : MIDPOINT (fast) or INTEGRATION (precise)
-        bin_strategy : BIN_UNIFORM (all nodes same) or BIN_ADAPTIVE
-                               (fewer bins for nodes with many continuous parents)
-        memory_warn_mb : print a warning if total CPT size exceeds this (MB)
-        memory_limit_mb : raise RuntimeError if total CPT size exceeds this (MB).
-                               None = no hard limit.
-        """
-        if discretization_method not in (MIDPOINT, INTEGRATION):
-            raise ValueError(
-                f"discretization_method must be '{MIDPOINT}' or '{INTEGRATION}'"
-            )
-        if bin_strategy not in (BIN_UNIFORM, BIN_ADAPTIVE):
-            raise ValueError(
-                f"bin_strategy must be '{BIN_UNIFORM}' or '{BIN_ADAPTIVE}'"
-            )
+    def __init__(self):
         # DESIGN state
         self._state: str = DESIGN
-        self._name: str = name
         self._specs: list[_NodeSpec] = []
-        self._n_bins: int = n_bins
-        self._bin_strategy: str = bin_strategy
-        self._memory_warn_mb: float = memory_warn_mb
-        self._memory_limit_mb: Optional[float] = memory_limit_mb
-        self._discretization_method: str = discretization_method
         self._plate_derived: set[str] = set()
         self._plate_groups: dict[str, list] = {}
-        # COMPILED state (populated by compile()) 
+        # COMPILED state (populated by compile())
         self._gum_bn: Optional[gum.BayesNet] = None
         self._nodes:  dict[str, BNNode] = {}
-
-    # To change de discretization method after construction
-    @property
-    def discretization_method(self) -> str:
-        return self._discretization_method
-
-    @discretization_method.setter
-    def discretization_method(self, value: str):
-        if value not in (MIDPOINT, INTEGRATION):
-            raise ValueError(
-                f"discretization_method must be '{MIDPOINT}' or '{INTEGRATION}'"
-            )
-        self._discretization_method = value
+        # Compilation options (set by compile())
+        self._name: Optional[str] = None
+        self._n_bins: Optional[int] = None
+        self._bin_strategy: Optional[str] = None
+        self._memory_warn_mb: Optional[float] = None
+        self._memory_limit_mb: Optional[float] = None
+        self._estimate_proba_method: Optional[str] = None
+        self._budget_entries_per_node: Optional[float] = None
 
     # sample
     def sample(self, name: str, distribution_or_fn: Union[object, Callable], parents: Optional[list[BNNode]] = None, n_bins: Optional[int] = None, labels: Optional[list] = None) -> BNNode:
@@ -354,10 +306,9 @@ class BNppl:
                 "Cannot declare nodes on a compiled BN. "
                 "Call bn.reopen() first to return to DESIGN state."
             )
-        full_name = self._full_name(name)
-        stub = BNNode(full_name, is_continuous=None, ticks=None)
+        stub = BNNode(name, is_continuous=None, ticks=None)
         self._specs.append(_NodeSpec(
-            name=full_name,
+            name=name,
             dist_or_fn=distribution_or_fn,
             parents=list(parents) if parents else [],
             node=stub,
@@ -504,17 +455,24 @@ class BNppl:
         return _BernoulliCPT(_Conditional([condition], p_true, p_false))
 
     # query
-    def query(self, target: Union[str, list], evidence: Optional[dict] = None) -> dict:
+    def query(self,
+              target: Union[str, list],
+              evidence: Optional[dict] = None,
+              joint: bool = False) -> dict:
         """
         Exact inference via LazyPropagation.
 
-        target: a node name (str) or a list of node names.
-          - Single target  -> {label: prob}
-          - Multiple targets -> {node_name: {label: prob}}
-
+        target  : a node name (str) or a list of node names.
         evidence: {node_name: value}  (bool, int index, or label string)
+        joint   : if True and target is a list, returns the joint distribution
+                  P(target[0], target[1], ... | evidence) as a dict with
+                  tuple keys — e.g. {("True", "False"): 0.12, ...}.
+                  If False (default), returns one marginal per target.
 
-        Raises RuntimeError if called before bn.compile().
+        Returns
+        -------
+        - Single target or joint=False  : {label: prob}  or  {node: {label: prob}}
+        - joint=True with list target   : {(label_0, label_1, ...): prob}
         """
         self._ensure_compiled()
         ie = gum.LazyPropagation(self._gum_bn)
@@ -522,39 +480,58 @@ class BNppl:
         if evidence:
             gum_ev = {}
             for var_name, val in evidence.items():
-                full = var_name if var_name in self._gum_bn.names() \
-                       else self._full_name(var_name)
                 if isinstance(val, bool):
-                    gum_ev[full] = "True" if val else "False"
+                    gum_ev[var_name] = "True" if val else "False"
                 elif isinstance(val, (int, float)):
-                    gum_ev[full] = int(val)
+                    gum_ev[var_name] = int(val)
                 else:
-                    gum_ev[full] = val
+                    gum_ev[var_name] = val
             ie.setEvidence(gum_ev)
 
         ie.makeInference()
+
+        if joint and isinstance(target, list) and len(target) > 1:
+            return self._joint_posterior_dict(ie, target)
 
         if isinstance(target, str):
             return self._posterior_dict(ie, target)
         return {t: self._posterior_dict(ie, t) for t in target}
 
     def _posterior_dict(self, ie, target: str) -> dict:
-        target_full = target if target in self._gum_bn.names() \
-                      else self._full_name(target)
-        posterior = ie.posterior(target_full)
-        var = self._gum_bn.variable(target_full)
-        return {var.label(i): float(posterior[{target_full: i}])
+        posterior = ie.posterior(target)
+        var = self._gum_bn.variable(target)
+        return {var.label(i): float(posterior[{target: i}])
                 for i in range(var.domainSize())}
 
-    def show(self):
+    def _joint_posterior_dict(self, ie, targets: list) -> dict:
+        ids = [self._gum_bn.idFromName(t) for t in targets]
+        potential = ie.jointPosterior(set(ids))
+        result = {}
+        inst = gum.Instantiation(potential)
+        inst.setFirst()
+        while not inst.end():
+            key = tuple(
+                self._gum_bn.variable(ids[i]).label(inst.val(ids[i]))
+                for i in range(len(targets))
+            )
+            result[key] = float(potential.get(inst))
+            inst.inc()
+        return result
+
+    def __str__(self) -> str:
         self._ensure_compiled()
-        print(f"\nBN compiled : {len(self._gum_bn.nodes())} nodes, "
-              f"{len(self._gum_bn.arcs())} arcs  "
-              f"[method={self._discretization_method}]")
-        print("Nodes :", list(self._gum_bn.names()))
-        print("Arcs  :", [(self._gum_bn.variable(a).name(),
-                           self._gum_bn.variable(b).name())
-                          for a, b in self._gum_bn.arcs()])
+        arcs = [(self._gum_bn.variable(a).name(), self._gum_bn.variable(b).name())
+                for a, b in self._gum_bn.arcs()]
+        return (
+            f"BN compiled: {len(self._gum_bn.nodes())} nodes, "
+            f"{len(self._gum_bn.arcs())} arcs  "
+            f"[method={self._estimate_proba_method}]\n"
+            f"Nodes: {list(self._gum_bn.names())}\n"
+            f"Arcs:  {arcs}"
+        )
+
+    def __repr__(self) -> str:
+        return self.__str__()
 
     @property
     def gum_bn(self) -> gum.BayesNet:
@@ -596,15 +573,17 @@ class BNppl:
 
         Priority:
           1. Per-node override: bn.sample(..., n_bins=20)
-          2. BIN_ADAPTIVE strategy: reduce bins based on continuous parent count
+          2. Strategy-specific formula (BIN_ADAPTIVE or BIN_MEMORY_BUDGET)
           3. Global self._n_bins (BIN_UNIFORM, default)
 
-        BIN_ADAPTIVE formula:
-            0 continuous parents -> n_bins
-            1 continuous parent  -> n_bins        (same, 1 parent is manageable)
-            2 continuous parents -> n_bins // 2
-            3 continuous parents -> n_bins // 4
-            k continuous parents -> max(3, n_bins // 2^(k-1))
+        BIN_ADAPTIVE:
+            k continuous parents -> max(3, n_bins // 2^(k-1))  for k >= 2
+
+        BIN_MEMORY_BUDGET:
+            Targets equal memory per node. Budget = memory_warn_mb / n_nodes.
+            For a node with k continuous parents and discrete-parent factor P:
+                n_bins_i = floor( (budget_entries / P) ^ (1 / (k+1)) )
+            Clamped to [3, n_bins].
         """
         if spec.n_bins_override is not None:
             return spec.n_bins_override
@@ -614,29 +593,90 @@ class BNppl:
             if n_cont > 1:
                 return max(3, self._n_bins // (2 ** (n_cont - 1)))
 
+        if self._bin_strategy == BIN_MEMORY_BUDGET:
+            n_cont = 0
+            prod_disc = 1
+            for p in spec.parents:
+                    try:
+                        prod_disc *= self._gum_bn.variable(p.name).domainSize()
+                    except Exception:
+                        #normalement self._specs est dans l'ordre topologique par contruction
+                        if p.is_continuous : 
+                            n_cont +=1
+                        else:
+                            prod_disc *= 2
+            target = self._budget_entries_per_node / max(1, prod_disc)
+            n = int(target ** (1.0 / (n_cont + 1)))
+            return max(3, min(self._n_bins, n))
+
         return self._n_bins
 
-    def compile(self) -> None:
+    def compile(self,n_bins: int = 10,estimate_proba_method: str = MIDPOINT,
+               bin_strategy: str = BIN_UNIFORM,memory_warn_mb: float = 50.0,
+               memory_limit_mb: Optional[float] = None,name: str = "BN") -> None:
         """
         Transitions DESIGN -> COMPILED.
 
-        Processes all pending _NodeSpec declarations in topological order
-        (declaration order = topological order by construction), builds the
-        pyAgrum BayesNet, fills all CPTs, then checks memory usage.
-
-        For each node, _resolve_n_bins() determines the effective bin count
-        based on the bin_strategy and any per-node n_bins override.
+        Parameters
+        ----------
+        n_bins               : bins per continuous variable (default 10)
+        estimate_proba_method: MIDPOINT (fast) or INTEGRATION (precise for coarse bins)
+        bin_strategy         : BIN_UNIFORM (all nodes same), BIN_ADAPTIVE
+                               (fewer bins for nodes with many continuous parents),
+                               or BIN_MEMORY_BUDGET (equal memory share per node,
+                               uses memory_warn_mb as the total budget)
+        memory_warn_mb       : print a warning if total CPT size exceeds this (MB)
+        memory_limit_mb      : raise RuntimeError if total CPT size exceeds this (MB)
+        name                 : name of the underlying pyAgrum BayesNet
         """
         if self._state == COMPILED:
             return
 
+        if estimate_proba_method not in (MIDPOINT, INTEGRATION):
+            raise ValueError(
+                f"estimate_proba_method must be '{MIDPOINT}' or '{INTEGRATION}'"
+            )
+        if bin_strategy not in (BIN_UNIFORM, BIN_ADAPTIVE, BIN_MEMORY_BUDGET):
+            raise ValueError(
+                f"bin_strategy must be '{BIN_UNIFORM}', '{BIN_ADAPTIVE}'"
+                f" or '{BIN_MEMORY_BUDGET}'"
+            )
+
+        self._name = name
+        self._n_bins = n_bins
+        self._bin_strategy = bin_strategy
+        self._memory_warn_mb = memory_warn_mb
+        self._memory_limit_mb = memory_limit_mb
+        self._estimate_proba_method = estimate_proba_method
+
         self._gum_bn = gum.BayesNet(self._name)
         self._nodes  = {}
 
+        total_entries = memory_warn_mb * 1e6 / 8.0
+        fixed_entries = 0
+        n_flexible = 0
+        for s in self._specs:
+            d = s.dist_or_fn
+            if s.n_bins_override is not None or isinstance(d, (Bernoulli, Categorical, Poisson, Binomial, _BernoulliCPT)):
+                if isinstance(d, Bernoulli):
+                    fixed_entries += 2
+                elif isinstance(d, Categorical):
+                    fixed_entries += len(d.probs)
+                elif isinstance(d, (Poisson, Binomial)):
+                    lo, hi = _get_discrete_domain(d)
+                    fixed_entries += (hi - lo + 1)
+                elif s.n_bins_override is not None and not s.parents:
+                    fixed_entries += s.n_bins_override
+                # _BernoulliCPT and n_bins_override with parents: skip (parent sizes unknown)
+            else:
+                n_flexible += 1
+        budget_for_flexible = max(0.0, total_entries - fixed_entries)
+        self._budget_entries_per_node = budget_for_flexible / max(1, n_flexible)
+
         for spec in self._specs:
-            d  = spec.dist_or_fn
+            d = spec.dist_or_fn
             parents = spec.parents
-            name = spec.name
+            node_name = spec.name
 
             # Temporarily override self._n_bins for this node's compilation
             saved_n_bins = self._n_bins
@@ -644,37 +684,29 @@ class BNppl:
 
             lbls = spec.labels
             if callable(d) and parents:
-                compiled = self._add_from_fn(name, d, parents, lbls)
+                compiled = self._add_from_fn(node_name, d, parents, lbls)
             elif isinstance(d, _BernoulliCPT):
-                compiled = self._add_bernoulli_cpt(name, d.cond, lbls)
+                compiled = self._add_bernoulli_cpt(node_name, d.cond, lbls)
             elif isinstance(d, Bernoulli):
-                compiled = self._add_bernoulli_root(name, d.probs, lbls)
+                compiled = self._add_bernoulli_root(node_name, d.probs, lbls)
             elif isinstance(d, Categorical):
-                compiled = self._add_categorical_root(name, d.probs, lbls)
+                compiled = self._add_categorical_root(node_name, d.probs, lbls)
             elif isinstance(d, (Poisson, Binomial)):
-                compiled = self._add_range_root(name, d)
+                compiled = self._add_range_root(node_name, d)
             else:
-                compiled = self._add_continuous(name, d)
+                compiled = self._add_continuous(node_name, d)
 
             self._n_bins = saved_n_bins   # restore
 
             spec.node.is_continuous = compiled.is_continuous
             spec.node.ticks = compiled.ticks
 
-        self._check_memory()
+        self._evaluate_memory()
         self._state = COMPILED
 
-    def _check_memory(self) -> None:
-        """
-        Prints a compilation summary and checks memory usage.
-
-        - Always prints total nodes, arcs, CPT entries and estimated memory.
-        - Prints per-node breakdown if any node exceeds memory_warn_mb / 4.
-        - Warns if total exceeds memory_warn_mb.
-        - Raises RuntimeError if total exceeds memory_limit_mb (hard limit).
-        """
-        # Per-node CPT sizes 
-        node_entries: list[tuple[int, str]] = []   # (entries, name)
+    def _evaluate_memory(self) -> None:
+        # Per-node CPT sizes
+        node_entries: list[tuple[int, str]] = []
         for name in self._gum_bn.names():
             node_id = self._gum_bn.idFromName(name)
             var_size = self._gum_bn.variable(name).domainSize()
@@ -687,19 +719,17 @@ class BNppl:
         mem_mb = total_entries * 8 / 1e6   # float64 = 8 bytes
         n_nodes = len(self._gum_bn.nodes())
 
-        # Summary line 
-        print(f"\nBN compiled : {n_nodes} nodes, "
-              f"{len(self._gum_bn.arcs())} arcs, "
-              f"{total_entries:,} CPT entries ({mem_mb:.3f} MB)"
-              f"  [n_bins={self._n_bins}, strategy={self._bin_strategy},"
-              f" method={self._discretization_method}]")
+        logger.info(
+            "BN compiled: %d nodes, %d arcs, %s CPT entries (%.3f MB)"
+            "  [n_bins=%d, strategy=%s, method=%s]",
+            n_nodes, len(self._gum_bn.arcs()), f"{total_entries:,}",
+            mem_mb, self._n_bins, self._bin_strategy, self._estimate_proba_method,
+        )
 
-        # Hard limit: raise before doing anything else 
+        # Hard limit — raise before any further processing
         if self._memory_limit_mb is not None and mem_mb > self._memory_limit_mb:
             top = sorted(node_entries, reverse=True)[:3]
-            top_str = ", ".join(
-                f"{n} ({e:,} entries)" for e, n in top
-            )
+            top_str = ", ".join(f"{n} ({e:,} entries)" for e, n in top)
             raise RuntimeError(
                 f"Compilation aborted: BN requires {mem_mb:.3f} MB "
                 f"which exceeds memory_limit_mb={self._memory_limit_mb} MB.\n"
@@ -710,55 +740,34 @@ class BNppl:
                 f"- Use per-node override: bn.sample(..., n_bins=5)"
             )
 
-        # Soft warning 
+        # Soft warning
         if mem_mb > self._memory_warn_mb:
             top = sorted(node_entries, reverse=True)[:3]
-            print(f"[WARN] Large BN ({mem_mb:.3f} MB > warn threshold "
-                  f"{self._memory_warn_mb:.3f} MB).")
-            print(f"Top-3 nodes by CPT size:")
-            for entries, name in top:
-                n_parents = len(list(self._gum_bn.parents(
-                    self._gum_bn.idFromName(name))))
-                print(f"{name:30s}  {entries:>8,} entries  "
-                      f"({n_parents} parents)")
-            print(f"Suggestions:")
-            print(f"- Reduce n_bins (currently {self._n_bins})")
+            top_lines = "\n".join(
+                f"  {name:<30s} {entries:>8,} entries  "
+                f"({len(list(self._gum_bn.parents(self._gum_bn.idFromName(name))))} parents)"
+                for entries, name in top
+            )
+            suggestions = f"- Reduce n_bins (currently {self._n_bins})"
             if self._bin_strategy == BIN_UNIFORM:
-                print(f"- Switch to bin_strategy=BIN_ADAPTIVE")
-            print(f"- Per-node override: "
-                  f"bn.sample('{top[0][1]}', ..., n_bins=5)")
+                suggestions += "\n- Switch to bin_strategy=BIN_ADAPTIVE or BIN_MEMORY_BUDGET"
+            elif self._bin_strategy == BIN_ADAPTIVE:
+                suggestions += "\n- Switch to bin_strategy=BIN_MEMORY_BUDGET"
+            suggestions += f"\n- Per-node override: bn.sample('{top[0][1]}', ..., n_bins=5)"
+            warnings.warn(
+                f"[WARN] Large BN ({mem_mb:.3f} MB > warn threshold "
+                f"{self._memory_warn_mb:.3f} MB).\n"
+                f"Top-3 nodes by CPT size:\n{top_lines}\n"
+                f"Suggestions:\n{suggestions}",
+                UserWarning,
+                stacklevel=3,
+            )
 
-    def _cpt_summary(self, template_name: str) -> str:
-        """Compact CPT summary for display (root nodes only)."""
-        node = self._nodes.get(template_name)
-        if node is None:
-            return ""
-        if node.is_continuous:
-            return "cont."
-        node_id = self._gum_bn.idFromName(template_name)
-        if self._gum_bn.parents(node_id):
-            return ""   # too complex to summarize
-        try:
-            var = self._gum_bn.variable(template_name)
-            cpt = self._gum_bn.cpt(template_name)
-            inst = gum.Instantiation(cpt)
-            inst.setFirst()
-            vals = []
-            while not inst.end():
-                vals.append(float(cpt[inst]))
-                inst.inc()
-            if var.domainSize() == 2:
-                return f"p={vals[1]:.2f}"
-            return "[" + ",".join(f"{v:.2f}" for v in vals) + "]"
-        except Exception:
-            return ""
 
-    def show_graph(self, show_cpt: bool = False) -> None:
+    def show_graph(self) -> None:
         """
         Displays the BN using graphviz (dot layout).
         Triggers compilation if still in DESIGN state.
-
-        show_cpt : show CPT summary under root nodes.
 
         Requires: pip install graphviz  (+ graphviz binaries on PATH)
         """
@@ -771,10 +780,10 @@ class BNppl:
                 "Also install the graphviz binaries: https://graphviz.org/download/"
             )
 
-        C_DISC  = "#AED6F1"   # light blue  — discrete / continuous nodes
-        C_PLATE = "#FAD7A0"   # light orange — plate-derived nodes
-        C_BOX   = "#EBF5FB"   # very light blue — plate cluster background
-        C_EDGE  = "#2874A6"   # dark blue   — cluster border
+        C_DISC  = "#AED6F1"
+        C_PLATE = "#FAD7A0"
+        C_BOX   = "#EBF5FB"
+        C_EDGE  = "#2874A6"
 
         # collapse plate groups: coin_1/coin_2/... → one representative node
         tmpl: dict[str, dict] = {}
@@ -793,14 +802,11 @@ class BNppl:
                 tmpl[rep]["label"] = base_name
                 plates_info[base_name] = {"size": len(members), "rep": rep}
 
-        def _resolve(n: str) -> str:
-            return plate_remap.get(n, n)
-
         arcs: list[tuple] = []
         seen_arcs: set = set()
         for a, b in self._gum_bn.arcs():
-            s = _resolve(self._gum_bn.variable(a).name())
-            d = _resolve(self._gum_bn.variable(b).name())
+            s = plate_remap.get(self._gum_bn.variable(a).name(), self._gum_bn.variable(a).name())
+            d = plate_remap.get(self._gum_bn.variable(b).name(), self._gum_bn.variable(b).name())
             if (s, d) not in seen_arcs and s in tmpl and d in tmpl:
                 seen_arcs.add((s, d))
                 arcs.append((s, d))
@@ -816,27 +822,17 @@ class BNppl:
         for base_name, info in plates_info.items():
             rep = info["rep"]
             nodes_in_cluster.add(rep)
-            lbl = tmpl[rep]["label"]
-            if show_cpt:
-                cpt_str = self._cpt_summary(rep)
-                if cpt_str:
-                    lbl = f"{lbl}\n{cpt_str}"
             with g.subgraph(name=f"cluster_{base_name}") as c:
                 c.attr(label=f"{base_name}  ×{info['size']}",
                        style="filled", fillcolor=C_BOX,
                        color=C_EDGE, fontsize="9", fontname="Helvetica",
                        fontcolor=C_EDGE)
-                c.node(rep, label=lbl, fillcolor=C_PLATE)
+                c.node(rep, label=tmpl[rep]["label"], fillcolor=C_PLATE)
 
         for n, data in tmpl.items():
             if n in nodes_in_cluster:
                 continue
-            lbl = data["label"]
-            if show_cpt:
-                cpt_str = self._cpt_summary(n)
-                if cpt_str:
-                    lbl = f"{lbl}\n{cpt_str}"
-            g.node(n, label=lbl, fillcolor=C_DISC)
+            g.node(n, label=data["label"], fillcolor=C_DISC)
 
         for s, d in arcs:
             g.edge(s, d)
@@ -848,8 +844,6 @@ class BNppl:
             g.view(cleanup=True)
 
     # internal methods: base nodes
-    def _full_name(self, name: str) -> str:
-        return name
 
     def _add_bernoulli_root(self, name: str, p: float, labels=None) -> BNNode:
         var = gum.LabelizedVariable(name, name, 2)
@@ -899,8 +893,7 @@ class BNppl:
         self._gum_bn.cpt(name).fillWith(_dist_to_cpt(distribution, ticks))
         return self._register(name, True, ticks)
 
-    def _register(self, name: str, is_continuous: bool,
-                  ticks: Optional[np.ndarray] = None) -> BNNode:
+    def _register(self, name: str, is_continuous: bool, ticks: Optional[np.ndarray] = None) -> BNNode:
         node = BNNode(name, is_continuous, ticks)
         self._nodes[name] = node
         return node
@@ -937,8 +930,7 @@ class BNppl:
             return self._add_range_from_fn(name, dist_fn, parents)
         return self._add_continuous_conditional(name, dist_fn, parents)
 
-    def _add_bernoulli_from_fn(self, name: str, dist_fn: Callable,
-                                parents: list[BNNode], labels=None) -> BNNode:
+    def _add_bernoulli_from_fn(self, name: str, dist_fn: Callable, parents: list[BNNode], labels=None) -> BNNode:
         """Bernoulli node whose probability is a function of parents (any types)."""
         var = gum.LabelizedVariable(name, name, 2)
         var.changeLabel(0, labels[0] if labels else "False")
@@ -960,8 +952,7 @@ class BNppl:
 
         return self._register(name, False)
 
-    def _add_categorical_from_fn(self, name: str, dist_fn: Callable,
-                                  parents: list[BNNode], labels=None) -> BNNode:
+    def _add_categorical_from_fn(self, name: str, dist_fn: Callable,parents: list[BNNode], labels=None) -> BNNode:
         """Categorical node (k values) whose probabilities are a function of parents."""
         probe_vals = [
             float((p.ticks[0] + p.ticks[-1]) / 2) if p.is_continuous else 0.0
@@ -1043,8 +1034,7 @@ class BNppl:
         return self._register(name, False)
 
     # conditional continuous node
-    def _add_continuous_conditional(self, name: str, dist_fn: Callable,
-                                     parents: list[BNNode]) -> BNNode:
+    def _add_continuous_conditional(self, name: str, dist_fn: Callable, parents: list[BNNode]) -> BNNode:
         """
         Continuous variable X whose parameters depend on parents.
         dist_fn(*parent_values) -> PyTorch distribution.
@@ -1106,7 +1096,7 @@ class BNppl:
 
                 cache[parent_bin_idxs] = (
                     self._cpt_midpoint(dist_fn, combo, x_ticks)
-                    if self._discretization_method == MIDPOINT
+                    if self._estimate_proba_method == MIDPOINT
                     else self._cpt_integration(dist_fn, combo, x_ticks)
                 )
 
@@ -1115,8 +1105,7 @@ class BNppl:
 
         return self._register(name, True, x_ticks)
 
-    def _cpt_midpoint(self, dist_fn: Callable,
-                       parent_combo, x_ticks: np.ndarray) -> list[float]:
+    def _cpt_midpoint(self, dist_fn: Callable, parent_combo, x_ticks: np.ndarray) -> list[float]:
         """
         Midpoint approximation: evaluates dist_fn at the center of each parent bin.
         Fast; accuracy increases with n_bins.

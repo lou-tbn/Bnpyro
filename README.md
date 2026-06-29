@@ -117,6 +117,7 @@ Posterior P(rate | k=6) — observing a high count updates the rate belief upwar
 | [`Discretization.ipynb`](Discretization.ipynb) | Deep dive: n_bins, MIDPOINT vs INTEGRATION, CPT explosion, BIN_ADAPTIVE, memory limits |
 | [`Pyro_vs_Bnpyro.ipynb`](Pyro_vs_Bnpyro.ipynb) | Side-by-side comparison with Pyro: discrete BN, plates/thunks, continuous MCMC vs exact BN |
 | [`recurse_examples.ipynb`](recurse_examples.ipynb) | Examples using `bn.recurse` for dynamic Bayesian networks |
+| [`SVI_Part_I_Pyro_vs_Bnpyro.ipynb`](SVI_Part_I_Pyro_vs_Bnpyro.ipynb) | Companion to the official Pyro "SVI Part I" tutorial: same Beta-Bernoulli model solved by Pyro SVI (approximate) and Bnpyro (exact), with visual comparison and a n_bins accuracy study |
 
 ### Tutorial examples (`Bnpyro_Tutorial.ipynb`)
 
@@ -287,7 +288,8 @@ Bnpyro_Tutorial.ipynb             # 8 worked examples
 Discretization.ipynb              # Discretization deep dive
 Pyro_vs_Bnpyro.ipynb              # Comparison with Pyro (discrete, plates, continuous)
 recurse_examples.ipynb            # Recursion / DBN examples
-BetaCoin_pyAgrum_vs_Bnpyro.ipybn  #Comparaison avec pyAgrum
+BetaCoin_pyAgrum_vs_Bnpyro.ipynb  # Comparison with pyAgrum
+SVI_Part_I_Pyro_vs_Bnpyro.ipynb  # Companion to Pyro SVI Part I tutorial (exact vs approximate)
 ```
 
 ---

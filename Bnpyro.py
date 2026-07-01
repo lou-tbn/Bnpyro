@@ -133,9 +133,42 @@ def _discretize_continuous(name: str, distribution, n_bins: int = 10):
 # Nodes
 
 class BNNode:
-    """A random variable node in a BNppl."""
+    """A random variable node in a BNppl.
+
+    Returned by :meth:`BNppl.sample` and :meth:`BNPlate.__call__`.
+    During the DESIGN phase the node is a *stub* (``is_continuous`` is
+    ``None``); after :meth:`BNppl.compile` it carries the full type
+    information needed by the CPT builder.
+
+    Attributes
+    ----------
+    name : str
+        Identifier of the corresponding pyAgrum node.
+    is_continuous : bool or None
+        ``True`` for discretized continuous nodes, ``False`` for
+        discrete/categorical nodes, ``None`` before compilation.
+    ticks : numpy.ndarray or None
+        Bin boundaries for continuous nodes (length ``n_bins + 1``);
+        ``None`` for discrete nodes and before compilation.
+
+    Notes
+    -----
+    ``BNNode`` objects **cannot** be used as Python booleans.  Use
+    ``bn.where(node, p_true, p_false)`` to build conditional CPTs.
+    """
 
     def __init__(self, name: str, is_continuous: bool = False, ticks: Optional[np.ndarray] = None):
+        """
+        Parameters
+        ----------
+        name : str
+            Node identifier (must be unique within the BN).
+        is_continuous : bool or None, optional
+            Whether the variable is continuous (discretized).
+            ``None`` during the DESIGN phase.
+        ticks : numpy.ndarray or None, optional
+            Bin boundary array for continuous nodes.
+        """
         self.name = name
         self.is_continuous = is_continuous
         self.ticks = ticks
@@ -154,17 +187,39 @@ class BNNode:
         )
 
 class BNPlate:
-    """
-    Plate from λ!-calculus: a frozen, reusable distribution (!t / bang).
-    Each call () instantiates a new independent node (der).
+    """Plate from λ!-calculus — a frozen, reusable distribution (``!t`` / bang).
 
-    Two modes:
-      Simple     - bn.plate("coin", dist.Bernoulli(0.5))
-      Parametric - bn.plate("coin", lambda b: dist.Bernoulli(b), parents=[bias_node])
+    Each call ``plate()`` instantiates a new independent node (``der`` /
+    dereliction).  The plate itself does **not** create a pyAgrum node;
+    only its calls do.
+
+    Two creation modes (via :meth:`BNppl.plate`):
+
+    * **Simple** — ``bn.plate("coin", Bernoulli(0.5))``
+    * **Parametric** — ``bn.plate("coin", lambda b: Bernoulli(b), parents=[bias_node])``
+
+    Attributes
+    ----------
+    _base_name : str
+        Prefix shared by all instantiated nodes (e.g. ``"coin"`` → ``"coin_1"``, …).
+    _call_count : int
+        Number of times the plate has been dereferenced.
     """
 
     def __init__(self, ctx: "BNppl", base_name: str,
                  dist_or_fn, fn_parents: Optional[list] = None):
+        """
+        Parameters
+        ----------
+        ctx : BNppl
+            Parent compilation context.
+        base_name : str
+            Prefix for auto-generated node names.
+        dist_or_fn : distribution or callable
+            Distribution to freeze, or lambda for the parametric mode.
+        fn_parents : list of BNNode, optional
+            Parent nodes for the parametric mode.
+        """
         self._ctx = ctx
         self._base_name = base_name
         self._dist_or_fn = dist_or_fn
@@ -172,6 +227,19 @@ class BNPlate:
         self._call_count = 0
 
     def __call__(self, name: Optional[str] = None) -> BNNode:
+        """Dereference the plate — create one new independent node (``der``).
+
+        Parameters
+        ----------
+        name : str, optional
+            Explicit node name.  Defaults to ``"<base>_<n>"`` where *n* is
+            the call count (1-indexed).
+
+        Returns
+        -------
+        BNNode
+            Stub of the newly declared node.
+        """
         self._call_count += 1
         node_name = name or f"{self._base_name}_{self._call_count}"
         d = self._dist_or_fn
@@ -264,6 +332,21 @@ class BNppl:
     """
 
     def __init__(self):
+        """Create an empty probabilistic program context (DESIGN state).
+
+        No parameters are needed at construction time; all compilation
+        options (``n_bins``, ``bin_strategy``, …) are passed to
+        :meth:`compile`.
+
+        Examples
+        --------
+        >>> bn   = BNppl()
+        >>> rain = bn.sample("rain", Bernoulli(0.2))
+        >>> wet  = bn.sample("wet",  bn.where(rain, 0.9, 0.01))
+        >>> bn.compile()
+        >>> bn.query("rain", evidence={"wet": True})
+        {'False': 0.054, 'True': 0.946}
+        """
         # DESIGN state
         self._state: str = DESIGN
         self._specs: list[_NodeSpec] = []
@@ -519,6 +602,19 @@ class BNppl:
         return result
 
     def __str__(self) -> str:
+        """Return a human-readable summary of the compiled BN.
+
+        Returns
+        -------
+        str
+            One-line header (node/arc counts, discretization method)
+            followed by the list of node names and arcs.
+
+        Raises
+        ------
+        RuntimeError
+            If called before :meth:`compile`.
+        """
         self._ensure_compiled()
         arcs = [(self._gum_bn.variable(a).name(), self._gum_bn.variable(b).name())
                 for a, b in self._gum_bn.arcs()]
@@ -535,6 +631,26 @@ class BNppl:
 
     @property
     def gum_bn(self) -> gum.BayesNet:
+        """The underlying pyAgrum ``BayesNet`` object (read-only).
+
+        Provides direct access to the full pyAgrum API for advanced
+        visualisation or inference operations.
+
+        Returns
+        -------
+        pyagrum.BayesNet
+            The compiled Bayesian network.
+
+        Raises
+        ------
+        RuntimeError
+            If accessed before :meth:`compile`.
+
+        Examples
+        --------
+        >>> import pyagrum.lib.notebook as gnb
+        >>> gnb.showBN(bn.gum_bn)
+        """
         self._ensure_compiled()
         return self._gum_bn
 

@@ -928,7 +928,7 @@ class BNppl:
                 arcs.append((s, d))
 
         g = graphviz.Digraph(name=self._name)
-        g.attr(rankdir="LR", fontname="Helvetica", fontsize="11", bgcolor="white")
+        g.attr(rankdir="LR", fontname="Helvetica", fontsize="11", bgcolor="transparent")
         g.attr("node", fontname="Helvetica", fontsize="11",
                style="filled", shape="ellipse", margin="0.15,0.08",
                penwidth="1.5", color="#2C3E50")
@@ -954,8 +954,12 @@ class BNppl:
             g.edge(s, d)
 
         try:
-            from IPython.display import display
-            display(g)
+            import re
+            from IPython.display import display, SVG
+            svg = g.pipe(format='svg').decode('utf-8')
+            # graphviz always adds a white background polygon — remove it
+            svg = re.sub(r'(<polygon[^>]*\bfill=")[^"]*(")', r'\1transparent\2', svg, count=1)
+            display(SVG(svg))
         except Exception:
             g.view(cleanup=True)
 
